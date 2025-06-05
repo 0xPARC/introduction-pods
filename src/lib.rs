@@ -6,7 +6,7 @@ use pod2::middleware::TypedValue;
 pub mod ed25519pod;
 
 pub enum PodType {
-    Ed25519 = 1001,
+    Ed25519 = 1002,
 }
 
 impl fmt::Display for PodType {

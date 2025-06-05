@@ -406,7 +406,7 @@ pub mod tests {
         // Use the sample data from plonky2_ed25519
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
-        let sig =  SshSig::from_pem(include_bytes!("../test_keys/ainta_ed25519.sig")).unwrap();
+        let sig =  SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
         let vds_root = EMPTY_HASH;
         
         
