@@ -14,7 +14,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
 use num::bigint::BigUint;
 use plonky2::{
-    field::{secp256k1_base::Secp256K1Base, secp256k1_scalar::Secp256K1Scalar, types::Field},
+    field::{secp256k1_scalar::Secp256K1Scalar, types::Field},
     hash::{
         hash_types::{HashOut, HashOutTarget},
         poseidon::PoseidonHash,
@@ -219,7 +219,8 @@ static STANDARD_ECDSA_POD_DATA: LazyLock<(EcdsaPodVerifyTarget, CircuitData<F, C
 
 fn build() -> Result<(EcdsaPodVerifyTarget, CircuitData<F, C, D>)> {
     let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
-    let config = CircuitConfig::standard_recursion_config();
+    let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
+    let config = rec_circuit_data.common.config.clone();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let ecdsa_pod_verify_target = EcdsaPodVerifyTarget::add_targets(&mut builder, params)?;
     let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
@@ -248,6 +249,11 @@ impl EcdsaPod {
             ecdsa_circuit_data.prove(pw)?
         );
 
+        // sanity check
+        ecdsa_circuit_data
+            .verifier_data()
+            .verify(ecdsa_verify_proof.clone())?;
+
         // 2. verify the ecdsa_verify proof in a EcdsaPodVerifyTarget circuit
 
         let (ecdsa_pod_target, circuit_data) = &*STANDARD_ECDSA_POD_DATA;
@@ -271,12 +277,10 @@ impl EcdsaPod {
             circuit_data.prove(pw)?
         );
 
-        #[cfg(test)] // sanity check
-        {
-            circuit_data
-                .verifier_data()
-                .verify(proof_with_pis.clone())?;
-        }
+        // sanity check
+        circuit_data
+            .verifier_data()
+            .verify(proof_with_pis.clone())?;
 
         Ok(EcdsaPod {
             params: params.clone(),
@@ -314,7 +318,7 @@ impl EcdsaPod {
         let public_inputs = id
             .to_fields(&self.params)
             .iter()
-            .chain(EMPTY_HASH.0.iter()) // slot for the unused vds root
+            .chain(self.vds_root().0.iter())
             .cloned()
             .collect_vec();
 
@@ -395,7 +399,7 @@ fn pub_self_statements(
     let st_type = type_statement();
 
     // hash the msg as in-circuit
-    let msg_limbs = scalar_to_limbs(msg);
+    let msg_limbs = secp_field_to_limbs(msg.0);
     let msg_hash = PoseidonHash::hash_no_pad(&msg_limbs);
 
     let st_msg = Statement::ValueOf(
@@ -404,8 +408,8 @@ fn pub_self_statements(
     );
 
     // hash the pk as in-circuit
-    let pk_x_limbs = base_to_limbs(pk.0.x);
-    let pk_y_limbs = base_to_limbs(pk.0.y);
+    let pk_x_limbs = secp_field_to_limbs(pk.0.x.0);
+    let pk_y_limbs = secp_field_to_limbs(pk.0.y.0);
     let pk_hash = PoseidonHash::hash_no_pad(&[pk_x_limbs, pk_y_limbs].concat());
 
     let st_pk = Statement::ValueOf(
@@ -416,19 +420,9 @@ fn pub_self_statements(
     vec![st_type, st_msg, st_pk]
 }
 
-fn scalar_to_limbs(v: Secp256K1Scalar) -> Vec<F> {
+fn secp_field_to_limbs(v: [u64; 4]) -> Vec<F> {
     let max_num_limbs = 8;
-    let v_biguint = biguint_from_array(std::array::from_fn(|i| v.0[i]));
-    let mut limbs = v_biguint.to_u32_digits();
-    assert!(max_num_limbs >= limbs.len());
-    limbs.resize(max_num_limbs, 0);
-    let limbs_f: Vec<F> = limbs.iter().map(|l| F::from_canonical_u32(*l)).collect();
-    limbs_f
-}
-
-fn base_to_limbs(v: Secp256K1Base) -> Vec<F> {
-    let max_num_limbs = 8;
-    let v_biguint = biguint_from_array(std::array::from_fn(|i| v.0[i]));
+    let v_biguint = biguint_from_array(std::array::from_fn(|i| v[i]));
     let mut limbs = v_biguint.to_u32_digits();
     assert!(max_num_limbs >= limbs.len());
     limbs.resize(max_num_limbs, 0);
@@ -453,7 +447,6 @@ fn biguint_from_array(arr: [u64; 4]) -> BigUint {
 pub mod tests {
     use std::any::Any;
 
-    use plonky2::field::types::Sample;
     use plonky2_ecdsa::curve::{
         curve_types::{Curve, CurveScalar},
         ecdsa::{ECDSAPublicKey, ECDSASecretKey, ECDSASignature, sign_message},
@@ -462,6 +455,64 @@ pub mod tests {
     use pod2::{self, frontend::MainPodBuilder, op};
 
     use super::*;
+
+    #[test]
+    fn test_pub_self_statements_target() -> Result<()> {
+        let params = &Default::default();
+
+        let msg = Secp256K1Scalar([321, 654, 987, 321]);
+        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
+        let pk: ECDSAPublicKey<Secp256K1> =
+            ECDSAPublicKey((CurveScalar(sk.0) * Secp256K1::GENERATOR_PROJECTIVE).to_affine());
+        let st = pub_self_statements(msg, pk)
+            .into_iter()
+            .map(mainpod::Statement::from)
+            .collect_vec();
+        let id_hash: HashOut<F> = HashOut::<F>::from_vec(
+            pod2::backends::plonky2::mainpod::calculate_id(&st, params)
+                .0
+                .to_vec(),
+        );
+
+        // circuit
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let mut pw = PartialWitness::<F>::new();
+
+        // add targets
+        let msg_targ = builder.add_virtual_nonnative_target::<Secp256K1Scalar>();
+        let pk_targ = ECDSAPublicKeyTarget(builder.add_virtual_affine_point_target::<Secp256K1>());
+        let expected_id = builder.add_virtual_hash();
+
+        // set values to targets
+        pw.set_biguint_target(
+            &msg_targ.value,
+            &biguint_from_array(std::array::from_fn(|i| msg.0[i])),
+        )?;
+        pw.set_biguint_target(&pk_targ.0.x.value, &biguint_from_array(pk.0.x.0))?;
+        pw.set_biguint_target(&pk_targ.0.y.value, &biguint_from_array(pk.0.y.0))?;
+        pw.set_hash_target(expected_id, id_hash)?;
+
+        let msg_field_targ: Vec<Target> = msg_targ.value.limbs.iter().map(|l| l.0).collect();
+        let pk_x_field_targ: Vec<Target> = pk_targ.0.x.value.limbs.iter().map(|l| l.0).collect();
+        let pk_y_field_targ: Vec<Target> = pk_targ.0.y.value.limbs.iter().map(|l| l.0).collect();
+        let pk_field_targ: Vec<Target> = [pk_x_field_targ, pk_y_field_targ].concat();
+        let st_targ =
+            pub_self_statements_target(&mut builder, params, &msg_field_targ, &pk_field_targ);
+        let id_targ = CalculateIdGadget {
+            params: params.clone(),
+        }
+        .eval(&mut builder, &st_targ);
+
+        builder.connect_hashes(expected_id, id_targ);
+
+        // generate & verify proof
+        let data = builder.build::<C>();
+        let proof = data.prove(pw)?;
+        data.verify(proof.clone())?;
+
+        Ok(())
+    }
 
     #[test]
     fn test_ecdsa_pod_verify() -> Result<()> {
@@ -481,8 +532,9 @@ pub mod tests {
             ..Default::default()
         };
 
-        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar::rand());
-        let msg = Secp256K1Scalar::rand();
+        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
+        let msg = Secp256K1Scalar([321, 654, 987, 321]);
+
         // compute the pk & signature
         let pk: ECDSAPublicKey<Secp256K1> =
             ECDSAPublicKey((CurveScalar(sk.0) * Secp256K1::GENERATOR_PROJECTIVE).to_affine());
@@ -509,7 +561,7 @@ pub mod tests {
         main_pod_builder.add_main_pod(main_ecdsa_pod.clone());
 
         // add operation that ensures that the msg is as expected in the EcdsaPod
-        let msg_limbs = scalar_to_limbs(msg);
+        let msg_limbs = secp_field_to_limbs(msg.0);
         let msg_hash = PoseidonHash::hash_no_pad(&msg_limbs);
         let msg_copy = main_pod_builder
             .pub_op(op!(
