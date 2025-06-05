@@ -1,7 +1,7 @@
 //ed25519pod.rs
 use std::sync::LazyLock;
 
-use base64::{prelude::BASE64_STANDARD, Engine};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
 use plonky2::{
     field::types::Field,
@@ -20,10 +20,11 @@ use plonky2::{
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
 };
-use plonky2_ed25519::gadgets::eddsa::{fill_circuits, make_verify_circuits, EDDSATargets};
+use plonky2_ed25519::gadgets::eddsa::{EDDSATargets, fill_circuits, make_verify_circuits};
 use pod2::{
     backends::plonky2::{
-        basetypes::{Proof, C, D},
+        Error, Result,
+        basetypes::{C, D, Proof},
         circuits::{
             common::{
                 CircuitBuilderPod, Flattenable, StatementArgTarget, StatementTarget, ValueTarget,
@@ -32,16 +33,15 @@ use pod2::{
         },
         mainpod,
         mainpod::calculate_id,
-        Error, Result,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, Hash, Key, NativePredicate, Params, Pod, PodId, RawValue,
-        Statement, ToFields, Value, EMPTY_HASH, F, KEY_TYPE, SELF,
+        self, AnchoredKey, DynError, EMPTY_HASH, F, Hash, KEY_TYPE, Key, NativePredicate, Params,
+        Pod, PodId, RawValue, SELF, Statement, ToFields, Value,
     },
     timed,
 };
-use ssh_key::{public::KeyData, SshSig};
+use ssh_key::{SshSig, public::KeyData};
 
 use crate::PodType;
 
@@ -117,7 +117,7 @@ impl Ed25519PodVerifyTarget {
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &Ed25519PodVerifyInput) -> Result<()> {
         pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
-        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0 .0.to_vec()))?;
+        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
         pw.set_target_arr(&self.vds_root.elements, &input.vds_root.0)?;
 
         Ok(())
@@ -163,7 +163,6 @@ fn build() -> Result<(Ed25519PodVerifyTarget, CircuitData<F, C, D>)> {
     Ok((ed25519_pod_verify_target, data))
 }
 
-
 /// Build SSH signed data format
 pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) -> Vec<u8> {
     // Use the SSH library's built-in method to create the signed data
@@ -177,9 +176,8 @@ impl Ed25519Pod {
         vds_root: Hash,
         raw_msg: &str,
         sig: &SshSig,
-        namespace: &str
+        namespace: &str,
     ) -> Result<Ed25519Pod> {
-
         // 1. Prove the Ed25519Verify circuit
         let (ed25519_verify_target, ed25519_circuit_data) = &*ED25519_VERIFY_DATA;
         let mut pw = PartialWitness::<F>::new();
@@ -187,10 +185,20 @@ impl Ed25519Pod {
 
         let pk = match sig.public_key() {
             KeyData::Ed25519(pk) => pk,
-            _ => return Err(Error::custom(String::from("signature does not carry an Ed25519 key"))),
+            _ => {
+                return Err(Error::custom(String::from(
+                    "signature does not carry an Ed25519 key",
+                )));
+            }
         };
 
-        fill_circuits::<F, 2>(&mut pw, &signed_data, sig.signature_bytes(), pk.as_ref(), &ed25519_verify_target);
+        fill_circuits::<F, 2>(
+            &mut pw,
+            &signed_data,
+            sig.signature_bytes(),
+            pk.as_ref(),
+            ed25519_verify_target,
+        );
 
         let ed25519_verify_proof = timed!(
             "prove the ed25519 signature verification (Ed25519VerifyTarget)",
@@ -202,7 +210,7 @@ impl Ed25519Pod {
 
         let statements = pub_self_statements(signed_data.as_slice(), pk.as_ref())
             .into_iter()
-            .map(|st| mainpod::Statement::from(st))
+            .map(mainpod::Statement::from)
             .collect_vec();
         let id: PodId = PodId(calculate_id(&statements, params));
 
@@ -236,12 +244,13 @@ impl Ed25519Pod {
         })
     }
 
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         params: &Params,
         vds_root: Hash,
         raw_msg: &str,
         sig: &SshSig,
-        namespace: &str
+        namespace: &str,
     ) -> Result<Box<dyn Pod>, Box<DynError>> {
         Ok(Self::_prove(params, vds_root, raw_msg, sig, namespace).map(Box::new)?)
     }
@@ -249,7 +258,7 @@ impl Ed25519Pod {
     fn _verify(&self) -> Result<()> {
         let statements = pub_self_statements(&self.msg, &self.pk)
             .into_iter()
-            .map(|st| mainpod::Statement::from(st))
+            .map(mainpod::Statement::from)
             .collect_vec();
         let id: PodId = PodId(calculate_id(&statements, &self.params));
         if id != self.id {
@@ -278,7 +287,7 @@ impl Pod for Ed25519Pod {
     fn params(&self) -> &Params {
         &self.params
     }
-    
+
     fn verify(&self) -> Result<(), Box<DynError>> {
         Ok(self._verify().map_err(Box::new)?)
     }
@@ -300,29 +309,26 @@ impl Pod for Ed25519Pod {
 }
 
 // Helper function to convert bit targets to byte targets
-fn bits_to_bytes_targets(
-    builder: &mut CircuitBuilder<F, D>,
-    bits: &[Target],
-) -> Vec<Target> {
+fn bits_to_bytes_targets(builder: &mut CircuitBuilder<F, D>, bits: &[Target]) -> Vec<Target> {
     assert_eq!(bits.len() % 8, 0);
     let mut bytes = Vec::new();
-    
+
     for chunk in bits.chunks(8) {
         // Convert 8 bits to a byte value
         let mut byte_val = builder.zero();
         let two = builder.two();
         let mut power = builder.one();
-        
+
         // Little-endian bit order
         for i in 0..8 {
             let bit_val = builder.mul(chunk[7 - i], power);
             byte_val = builder.add(byte_val, bit_val);
             power = builder.mul(power, two);
         }
-        
+
         bytes.push(byte_val);
     }
-    
+
     bytes
 }
 
@@ -340,8 +346,8 @@ fn pub_self_statements_target(
     pk: &[Target],
 ) -> Vec<StatementTarget> {
     let st_type = StatementTarget::from_flattened(
-        &params,
-        &builder.constants(&type_statement().to_fields(&params)),
+        params,
+        &builder.constants(&type_statement().to_fields(params)),
     );
 
     let ak_podid = builder.constant_value(RawValue::from(SELF.0));
@@ -391,10 +397,12 @@ fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-    use ssh_key::SshSig;
     use std::any::Any;
+
     use pod2::{self, frontend::MainPodBuilder};
+    use ssh_key::SshSig;
+
+    use super::*;
 
     #[test]
     fn test_ed25519_pod_verify() -> Result<()> {
@@ -406,10 +414,9 @@ pub mod tests {
         // Use the sample data from plonky2_ed25519
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
-        let sig =  SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
+        let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
         let vds_root = EMPTY_HASH;
-        
-        
+
         let ed25519_pod = timed!(
             "Ed25519Pod::new",
             Ed25519Pod::new(&params, vds_root, msg, &sig, namespace).unwrap()
