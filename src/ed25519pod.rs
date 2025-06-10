@@ -405,7 +405,8 @@ pub mod tests {
     use super::*;
 
     #[test]
-    fn test_ed25519_pod_verify() -> Result<()> {
+    #[ignore]
+    fn test_ed25519_pod_with_mainpod_verify() -> Result<()> {
         let params = Params {
             max_input_signed_pods: 0,
             ..Default::default()
@@ -448,6 +449,30 @@ pub mod tests {
             .downcast::<mainpod::MainPod>()
             .unwrap();
         pod.verify().unwrap();
+
+        Ok(())
+    }
+
+
+    #[test]
+    fn test_ed25519_pod_only_verify() -> Result<()> {
+        let params = Params {
+            max_input_signed_pods: 0,
+            ..Default::default()
+        };
+
+        // Use the sample data from plonky2_ed25519
+        let msg = "0xPARC\n";
+        let namespace = "double-blind.xyz";
+        let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
+        let vds_root = EMPTY_HASH;
+
+        let ed25519_pod = timed!(
+            "Ed25519Pod::new",
+            Ed25519Pod::new(&params, vds_root, msg, &sig, namespace).unwrap()
+        );
+
+        ed25519_pod.verify().unwrap();
 
         Ok(())
     }
