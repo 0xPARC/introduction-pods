@@ -17,24 +17,29 @@ use plonky2_rsa::gadgets::{
     rsa::pow_65537,
 };
 use ssh_key::{
-    PublicKey, SshSig,
+    PublicKey, SshSig, Mpint,
     public::{KeyData, RsaPublicKey},
 };
+use pod2::backends::plonky2::basetypes::{D, F};
 
 pub(super) const BITS: usize = 27;
 type BigUintTarget = plonky2_rsa::gadgets::biguint::BigUintTarget<BITS>;
 
 pub(super) const RSA_LIMBS: usize = 4096usize.div_ceil(BITS);
 
+
 static DB_MSG_RSA_STR: &str = "1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff003051300d060960864801650304020305000440bed2662fe0f7b308ad3b5d19ca0d77af4235ce8b0e39a2986440658df91a32e503813121336ac764a10fb6e508d205b5ebaf0a291876385634a86cfea2d688cd";
 static DB_MSG_RSA: LazyLock<BigUint> =
     LazyLock::new(|| BigUint::from_str_radix(DB_MSG_RSA_STR, 16).unwrap());
 
-use crate::mpint_to_biguint;
 
-use super::{D, F};
+fn mpint_to_biguint(x: &Mpint) -> BigUint {
+    BigUint::from_bytes_be(x.as_positive_bytes().unwrap())
+}
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+//#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+// TODO do I care about serialization?
+#[derive(Clone, Debug)]
 pub struct RSATargets {
     pub signature: BigUintTarget,
     pub modulus: BigUintTarget,
@@ -67,7 +72,7 @@ pub fn rsa_key_target_data(key: &RsaPublicKey) -> Vec<F> {
 }
 
 pub fn rsa_example_signature() -> SshSig {
-    SshSig::from_pem(include_bytes!("../test_keys/rsa.sig")).unwrap()
+    SshSig::from_pem(include_bytes!("../test_keys/id_rsa_helloworld.sig")).unwrap()
 }
 
 pub fn rsa_example_public_key() -> PublicKey {
