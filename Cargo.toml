@@ -17,6 +17,10 @@ pod2 = { git="https://github.com/0xPARC/pod2", rev="7bc0bd08d29499df15d147e818b3
 plonky2_ecdsa = {git = "https://github.com/ax0/plonky2-ecdsa"}
 num = { version = "0.4.0", default-features = false }
 
+# RsaPod specifc dependencies:
+plonky2_ed25519 = {git = "https://github.com/ainta/plonky2-ed25519"}
+ssh-key = { version = "0.6.7", features = ["ed25519"] }
+
 [features]
 default = []
 metrics = ["pod2/metrics"]
