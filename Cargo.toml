@@ -10,7 +10,7 @@ plonky2 = { git = "https://github.com/0xPolygonZero/plonky2" }
 base64 = "0.22.1"
 # we use a specific commit to avoid breaking changes in the interfaces, updating
 # to latest pod2 version from time to time.
-pod2 = { git="https://github.com/0xPARC/pod2", rev="19abde5391c6731cd4d0b26f7d663073e3bd91af" }
+pod2 = { git="https://github.com/0xPARC/pod2", rev="c66506c04871dd87c40284de31490e33e2179804" }
 
 # EcdsaPod specific dependencies:
 plonky2_ecdsa = {git = "https://github.com/ax0/plonky2-ecdsa"}
