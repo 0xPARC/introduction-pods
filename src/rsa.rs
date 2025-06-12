@@ -43,7 +43,7 @@ fn mpint_to_biguint(x: &Mpint) -> BigUint {
 pub struct RSATargets {
     pub signature: BigUintTarget,
     pub modulus: BigUintTarget,
-    pub digest: BigUintTarget
+    pub padded_data: BigUintTarget
 }
 
 impl RSATargets {
@@ -73,7 +73,7 @@ pub fn rsa_key_target_data(key: &RsaPublicKey) -> Vec<F> {
 }
 
 pub fn rsa_example_signature() -> SshSig {
-    SshSig::from_pem(include_bytes!("../test_keys/id_rsa_helloworld.sig")).unwrap()
+    SshSig::from_pem(include_bytes!("../test_keys/id_rsa_example.sig")).unwrap()
 }
 
 pub fn rsa_example_public_key() -> PublicKey {
@@ -89,8 +89,8 @@ pub fn rsa_example_public_key_2() -> PublicKey {
 pub fn build_rsa(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
     let signature = builder.add_virtual_biguint_target(RSA_LIMBS);
     let modulus = builder.add_virtual_biguint_target(RSA_LIMBS);
-    let digest = pow_65537(builder, &signature, &modulus);
-    RSATargets { signature, modulus, digest }
+    let padded_data = builder.add_virtual_biguint_target(RSA_LIMBS);
+    RSATargets { signature, modulus, padded_data }
 }
 
 pub fn is_rsa_key_supported(key: &RsaPublicKey) -> bool {
@@ -102,9 +102,12 @@ pub fn set_rsa_targets(
     pw: &mut PartialWitness<F>,
     targets: &RSATargets,
     sig: &SshSig,
+    padded_data: &Vec<u8>
 ) -> anyhow::Result<()> {
     let signature = BigUint::from_bytes_be(sig.signature_bytes());
     pw.set_biguint_target(&targets.signature, &signature)?;
+    let padded_data_int = BigUint::from_bytes_be(padded_data);
+    pw.set_biguint_target(&targets.padded_data, &padded_data_int)?;
     if let KeyData::Rsa(key) = sig.public_key() {
         let modulus = public_key_modulus(key);
         pw.set_biguint_target(&targets.modulus, &modulus)?;
