@@ -5,26 +5,25 @@ use pod2::{
     backends::plonky2::{basetypes::{C, D}, Error, Result}, middleware::{self, DynError, Hash, Params, Pod, PodId, Proof, F}, timed
 };
 use plonky2::plonk::{circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData}};
+use crate::rsa::{RSATargets, build_rsa};
+use ssh_key::SshSig;
 
 
-pub struct RSATargets {
-    // TODO implement RSATargets
-}
 
-fn make_verify_circuits(builder: &mut CircuitBuilder<F, D>, len: usize) -> RSATargets {
-    panic!("make_verify_circuits not implemented");
+fn make_verify_circuits(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
+    return build_rsa(builder);
 }
 
 // Standard message length for ED25519 pods (can be made configurable)
-const SIGNED_DATA_LEN: usize = 108; // SIGNED_DATA_LEN = 108 u8 = 864 bits
+// const SIGNED_DATA_LEN: usize = 108; // SIGNED_DATA_LEN = 108 u8 = 864 bits
 
 static RSA_VERIFY_DATA: LazyLock<(RSATargets, CircuitData<F, C, D>)> =
     LazyLock::new(|| build_rsa_verify().expect("successful build"));
 
 fn build_rsa_verify() -> Result<(RSATargets, CircuitData<F, C, D>)> {
-    let config = CircuitConfig::wide_ecc_config();
+    let config = CircuitConfig::standard_recursion_config(); // TODO is this the right config?
     let mut builder = CircuitBuilder::<F, D>::new(config);
-    let rsa_verify_target = make_verify_circuits(&mut builder, SIGNED_DATA_LEN);
+    let rsa_verify_target = make_verify_circuits(&mut builder);
 
     let data = timed!("Ed25519Verify build", builder.build::<C>());
     Ok((rsa_verify_target, data))

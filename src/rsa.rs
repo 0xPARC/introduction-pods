@@ -28,9 +28,9 @@ type BigUintTarget = plonky2_rsa::gadgets::biguint::BigUintTarget<BITS>;
 pub(super) const RSA_LIMBS: usize = 4096usize.div_ceil(BITS);
 
 
-static DB_MSG_RSA_STR: &str = "1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff003051300d060960864801650304020305000440bed2662fe0f7b308ad3b5d19ca0d77af4235ce8b0e39a2986440658df91a32e503813121336ac764a10fb6e508d205b5ebaf0a291876385634a86cfea2d688cd";
-static DB_MSG_RSA: LazyLock<BigUint> =
-    LazyLock::new(|| BigUint::from_str_radix(DB_MSG_RSA_STR, 16).unwrap());
+//static DB_MSG_RSA_STR: &str = "1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff003051300d060960864801650304020305000440bed2662fe0f7b308ad3b5d19ca0d77af4235ce8b0e39a2986440658df91a32e503813121336ac764a10fb6e508d205b5ebaf0a291876385634a86cfea2d688cd";
+//static DB_MSG_RSA: LazyLock<BigUint> =
+//    LazyLock::new(|| BigUint::from_str_radix(DB_MSG_RSA_STR, 16).unwrap());
 
 
 fn mpint_to_biguint(x: &Mpint) -> BigUint {
@@ -43,6 +43,7 @@ fn mpint_to_biguint(x: &Mpint) -> BigUint {
 pub struct RSATargets {
     pub signature: BigUintTarget,
     pub modulus: BigUintTarget,
+    pub digest: BigUintTarget
 }
 
 impl RSATargets {
@@ -89,9 +90,7 @@ pub fn build_rsa(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
     let signature = builder.add_virtual_biguint_target(RSA_LIMBS);
     let modulus = builder.add_virtual_biguint_target(RSA_LIMBS);
     let digest = pow_65537(builder, &signature, &modulus);
-    let expected = builder.constant_biguint(&DB_MSG_RSA);
-    builder.connect_biguint(&digest, &expected);
-    RSATargets { signature, modulus }
+    RSATargets { signature, modulus, digest }
 }
 
 pub fn is_rsa_key_supported(key: &RsaPublicKey) -> bool {
