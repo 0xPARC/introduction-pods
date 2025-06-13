@@ -151,7 +151,6 @@ pub struct RsaPod {
 
 impl middleware::RecursivePod for RsaPod {
     fn verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
-        //let (_, circuit_data): (u32, &CircuitData<F, C, D>) = panic!("Rsa pod verification circuit data not available");//&*STANDARD_ED25519_POD_DATA;
         let (_, circuit_data) = &*RSA_POD_DATA;
         circuit_data.verifier_data().verifier_only
     }
@@ -187,6 +186,11 @@ impl RsaPod {
 
         
         let pk_bytes = pk.n.as_positive_bytes().expect("Public key was negative").to_vec();
+        if pk_bytes.len() != RSA_BYTE_SIZE {
+            return Err(Error::custom(String::from(
+                "Public key was not the correct size",
+            )));
+        }
 
 
         let statements = pub_self_statements(&encoded_padded_data, &pk_bytes)
@@ -228,7 +232,7 @@ impl RsaPod {
         })
     }
 
-    #[allow(clippy::new_ret_no_self)]// TODO what does this do?
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         params: &Params,
         vds_root: Hash,
@@ -462,13 +466,6 @@ pub mod tests {
         );
         return Ok(rsa_pod);
     }
-
-    //#[test]
-    //fn rsa_pod_only() -> Result<()> {
-    //    let _rsa_pod = get_test_rsa_pod().unwrap();
-    //    Ok(())
-    //}
-
 
     #[test]
     fn rsa_pod_only_verify() -> Result<()> {

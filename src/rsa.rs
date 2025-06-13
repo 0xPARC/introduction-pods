@@ -6,19 +6,26 @@
 use anyhow::anyhow;
 use num::BigUint;
 use plonky2::{
-    field::types::Field,
-    iop::{target::Target, witness::PartialWitness},
+    iop::{
+        target::Target, witness::PartialWitness
+    },
     plonk::circuit_builder::CircuitBuilder,
 };
 use plonky2_rsa::gadgets::{
-    biguint::{CircuitBuilderBigUint, WitnessBigUint, split_biguint},
+    biguint::{
+        CircuitBuilderBigUint, WitnessBigUint
+    },
     rsa::pow_65537,
 };
 use ssh_key::{
-    PublicKey, SshSig, Mpint,
-    public::{KeyData, RsaPublicKey},
+    SshSig, Mpint,
+    public::{
+        KeyData, RsaPublicKey
+    },
 };
-use pod2::backends::plonky2::basetypes::{D, F};
+use pod2::backends::plonky2::basetypes::{
+    D, F
+};
 
 pub(super) const BITS: usize = 27;
 pub type BigUintTarget = plonky2_rsa::gadgets::biguint::BigUintTarget<BITS>;
@@ -26,17 +33,11 @@ pub type BigUintTarget = plonky2_rsa::gadgets::biguint::BigUintTarget<BITS>;
 pub(super) const RSA_LIMBS: usize = 4096usize.div_ceil(BITS);
 
 
-//static DB_MSG_RSA_STR: &str = "1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff003051300d060960864801650304020305000440bed2662fe0f7b308ad3b5d19ca0d77af4235ce8b0e39a2986440658df91a32e503813121336ac764a10fb6e508d205b5ebaf0a291876385634a86cfea2d688cd";
-//static DB_MSG_RSA: LazyLock<BigUint> =
-//    LazyLock::new(|| BigUint::from_str_radix(DB_MSG_RSA_STR, 16).unwrap());
-
-
 fn mpint_to_biguint(x: &Mpint) -> BigUint {
     BigUint::from_bytes_be(x.as_positive_bytes().unwrap())
 }
 
 //#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-// TODO do I care about serialization?
 #[derive(Clone, Debug)]
 pub struct RSATargets {
     pub signature: BigUintTarget,
@@ -59,28 +60,6 @@ fn public_key_modulus(key: &RsaPublicKey) -> BigUint {
     mpint_to_biguint(&key.n)
 }
 
-/// Returns the internal representation of the public key.  This function
-/// should be consistent with `RSATargets::public_key_targets`.
-pub fn rsa_key_target_data(key: &RsaPublicKey) -> Vec<F> {
-    let modulus = public_key_modulus(key);
-    let digits: Vec<_> = split_biguint::<BITS>(&modulus);
-    digits
-        .into_iter()
-        .map(|d| F::from_canonical_u32(d))
-        .collect()
-}
-
-pub fn rsa_example_signature() -> SshSig {
-    SshSig::from_pem(include_bytes!("../test_keys/id_rsa_example.sig")).unwrap()
-}
-
-pub fn rsa_example_public_key() -> PublicKey {
-    PublicKey::from_openssh(include_str!("../test_keys/id_rsa.pub")).unwrap()
-}
-
-pub fn rsa_example_public_key_2() -> PublicKey {
-    PublicKey::from_openssh(include_str!("../test_keys/id_rsa_2.pub")).unwrap()
-}
 
 /// Builds the RSA part of the circuit.  Returns the targets containing the public
 /// key and Double Blind key.
@@ -92,11 +71,6 @@ pub fn build_rsa(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
     builder.connect_biguint(&padded_data, &computed_padded_data);
     RSATargets { signature, modulus, padded_data }
 
-}
-
-pub fn is_rsa_key_supported(key: &RsaPublicKey) -> bool {
-    key.n.as_positive_bytes().is_some_and(|b| b.len() == 512)
-        && key.e.as_positive_bytes() == Some(&[1, 0, 1])
 }
 
 pub fn set_rsa_targets(
