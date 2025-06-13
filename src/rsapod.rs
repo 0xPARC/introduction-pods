@@ -6,21 +6,22 @@ use pod2::{
     backends::plonky2::{
         basetypes::{
             C, D
-        },
-        Error, Result, mainpod::{self, calculate_id}
+        }, mainpod::{self, calculate_id}, Error, Result
     },
     middleware::{
-        self, DynError, Hash, Params, Pod, PodId, Proof, F
+        self, AnchoredKey, DynError, Hash, Params, Pod, PodId, Proof, RawValue, Value, F, Statement, EMPTY_HASH, SELF, KEY_TYPE
     }, 
     timed
 };
-use plonky2::{iop::witness::PartialWitness, plonk::{circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData}}};
-use crate::rsa::{RSATargets, build_rsa, set_rsa_targets};
+use plonky2::{field::types::Field, hash::poseidon::PoseidonHash, iop::witness::PartialWitness, plonk::{config::Hasher, circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData}}};
+use crate::{PodType, rsa::{RSATargets, build_rsa, set_rsa_targets}};
 use ssh_key::{public::{KeyData}, Algorithm, HashAlg, SshSig};
-use pod2::middleware::EMPTY_HASH;
 use sha2::{Sha512, Sha256, Digest};
 
 const RSA_BYTE_SIZE: usize = 512;
+
+const KEY_SIGNED_MSG: &str = "signed_msg"; // TODO indicate signing algorithm? bit size?
+const KEY_RSA_PK: &str = "rsa_pk"; // TODO indicate bit size?
 
 fn make_verify_circuits(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
     return build_rsa(builder);
@@ -164,9 +165,35 @@ impl Pod for RsaPod {
     }
 }
 
+fn type_statement() -> Statement {
+    Statement::ValueOf(
+        AnchoredKey::from((SELF, KEY_TYPE)),
+        Value::from(PodType::Rsa),
+    )
+}
+
 fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement> {
-    /* TODO */
-    panic!("pub_self_statements not implemented");
+    let st_type = type_statement();
+
+    // Hash the message
+    let msg_fields: Vec<F> = msg.iter().map(|&b| F::from_canonical_u8(b)).collect();
+    let msg_hash = PoseidonHash::hash_no_pad(&msg_fields);
+
+    let st_msg = Statement::ValueOf(
+        AnchoredKey::from((SELF, KEY_SIGNED_MSG)),
+        Value::from(RawValue(msg_hash.elements)),
+    );
+
+    // Hash the public key
+    let pk_fields: Vec<F> = pk.iter().map(|&b| F::from_canonical_u8(b)).collect();
+    let pk_hash = PoseidonHash::hash_no_pad(&pk_fields);
+
+    let st_pk = Statement::ValueOf(
+        AnchoredKey::from((SELF, KEY_RSA_PK)),
+        Value::from(RawValue(pk_hash.elements)),
+    );
+
+    vec![st_type, st_msg, st_pk]
 }
 
 
@@ -215,7 +242,6 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
     padded_data.push(0x00);           // Separator 0x00
     padded_data.extend_from_slice(&combined_data); // DigestInfo T
 
-    println!("{:?}", padded_data);
     Ok(padded_data)
 }
 
@@ -243,7 +269,6 @@ pub mod tests {
         return Ok(rsa_pod);
     }
 
-    #[ignore]
     #[test]
     fn rsa_pod_only() -> Result<()> {
         let rsa_pod = get_test_rsa_pod().unwrap();
