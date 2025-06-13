@@ -1,48 +1,143 @@
-use std::{sync::LazyLock};
+use std::sync::LazyLock;
 
-use base64::{Engine, prelude::BASE64_STANDARD};
+use base64::{
+    Engine, prelude::BASE64_STANDARD
+};
 use itertools::Itertools;
 use pod2::{
     backends::plonky2::{
         basetypes::{
             C, D
-        }, mainpod::{self, calculate_id}, Error, Result
+        },
+        mainpod::{
+            self, calculate_id
+        },
+        circuits::{
+            mainpod::CalculateIdGadget,
+            common::{
+                StatementTarget, StatementArgTarget, ValueTarget, CircuitBuilderPod, Flattenable
+            }
+        },
+        Error,
+        Result
     },
     middleware::{
-        self, AnchoredKey, DynError, Hash, Params, Pod, PodId, Proof, RawValue, Value, F, Statement, EMPTY_HASH, SELF, KEY_TYPE
+        self, AnchoredKey, DynError, Hash, Params, Pod, PodId, Proof, RawValue, Value, F, Statement, EMPTY_HASH, SELF, KEY_TYPE, ToFields, NativePredicate, Key
     }, 
     timed
 };
-use plonky2::{field::types::Field, hash::poseidon::PoseidonHash, iop::witness::PartialWitness, plonk::{config::Hasher, circuit_builder::CircuitBuilder, circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData}}};
-use crate::{PodType, rsa::{RSATargets, build_rsa, set_rsa_targets}};
-use ssh_key::{public::{KeyData}, Algorithm, HashAlg, SshSig};
-use sha2::{Sha512, Sha256, Digest};
+use plonky2::{
+    field::types::Field,
+    hash::{
+        poseidon::PoseidonHash,
+        hash_types::{
+            HashOutTarget, HashOut
+        }
+    },
+    iop::{
+        witness::{
+            PartialWitness, WitnessWrite
+        },
+        target::{
+            Target, BoolTarget
+        }
+    },
+    plonk::{
+        config::Hasher,
+        circuit_builder::CircuitBuilder,
+        circuit_data::{
+            CircuitConfig, CircuitData, VerifierOnlyCircuitData
+        },
+        proof::{
+            ProofWithPublicInputs
+        }
+    }
+};
+use crate::{
+    PodType,
+    rsa::{
+        RSATargets, build_rsa, set_rsa_targets, BigUintTarget, BITS
+    }
+};
+use ssh_key::{
+    public::KeyData, Algorithm, HashAlg, SshSig
+};
+use sha2::{
+    Sha512, Sha256, Digest
+};
 
 const RSA_BYTE_SIZE: usize = 512;
 
 const KEY_SIGNED_MSG: &str = "signed_msg"; // TODO indicate signing algorithm? bit size?
 const KEY_RSA_PK: &str = "rsa_pk"; // TODO indicate bit size?
-
+/*
 fn make_verify_circuits(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
     return build_rsa(builder);
 }
-
+ */
 // Standard message length for ED25519 pods (can be made configurable)
 // const SIGNED_DATA_LEN: usize = 108; // SIGNED_DATA_LEN = 108 u8 = 864 bits
 
-static RSA_VERIFY_DATA: LazyLock<(RSATargets, CircuitData<F, C, D>)> =
-    LazyLock::new(|| build_rsa_verify().expect("successful build"));
+static RSA_POD_DATA: LazyLock<(RsaPodVerifyTarget, CircuitData<F, C, D>)> =
+    LazyLock::new(|| build().expect("successful build"));
 
-fn build_rsa_verify() -> Result<(RSATargets, CircuitData<F, C, D>)> {
+fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
+    let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
     let config = CircuitConfig::standard_recursion_config(); // TODO is this the right config?
     let mut builder = CircuitBuilder::<F, D>::new(config);
-    let rsa_verify_target = make_verify_circuits(&mut builder);
+    let rsa_pod_verify_target = RsaPodVerifyTarget::add_targets(&mut builder, params);
+
 
     let data = timed!("Ed25519Verify build", builder.build::<C>());
-    Ok((rsa_verify_target, data))
+    Ok((rsa_pod_verify_target, data))
 }
 
+#[derive(Clone, Debug)]
+struct RsaPodVerifyTarget {
+    vds_root: HashOutTarget,
+    id: HashOutTarget,
+    rsa_verify_target: RSATargets,
+}
 
+impl RsaPodVerifyTarget {
+    fn add_targets(builder: &mut CircuitBuilder<F, D>, params: &Params) -> Self {
+        let vds_root = builder.add_virtual_hash();
+        let rsa_verify_target = build_rsa(builder);
+
+        
+        let msg_bits = biguint_to_bits_targets(builder, &rsa_verify_target.padded_data, 8 * RSA_BYTE_SIZE);
+        let msg_bytes = le_bits_to_bytes_targets(builder, &msg_bits);
+        let modulus_bits = biguint_to_bits_targets(builder, &rsa_verify_target.modulus, 8 * RSA_BYTE_SIZE);
+        let modulus_bytes = le_bits_to_bytes_targets(builder, &modulus_bits);
+
+        
+        let statements = pub_self_statements_target(builder, params, &msg_bytes, &modulus_bytes);
+        let id = CalculateIdGadget {
+            params: params.clone(),
+        }
+        .eval(builder, &statements);
+
+        builder.register_public_inputs(&id.elements);
+        builder.register_public_inputs(&vds_root.elements);
+
+        Self { vds_root, id, rsa_verify_target}
+    }
+
+    fn set_targets(&self, pw: &mut PartialWitness<F>, input: &RsaPodVerifyInput) -> Result<()> {
+        set_rsa_targets(pw, &self.rsa_verify_target, &input.sig, &input.padded_data)?;
+        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
+        pw.set_target_arr(&self.vds_root.elements, &input.vds_root.0)?;
+
+        Ok(())
+    }
+}
+
+pub struct RsaPodVerifyInput<'a> {
+    vds_root: Hash,
+    id: PodId,
+    sig: &'a SshSig,
+    padded_data: &'a Vec<u8>
+}
 
 #[derive(Clone, Debug)]
 pub struct RsaPod {
@@ -57,7 +152,7 @@ pub struct RsaPod {
 impl middleware::RecursivePod for RsaPod {
     fn verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
         //let (_, circuit_data): (u32, &CircuitData<F, C, D>) = panic!("Rsa pod verification circuit data not available");//&*STANDARD_ED25519_POD_DATA;
-        let (_, circuit_data) = &*RSA_VERIFY_DATA;
+        let (_, circuit_data) = &*RSA_POD_DATA;
         circuit_data.verifier_data().verifier_only
     }
     fn proof(&self) -> Proof {
@@ -76,9 +171,8 @@ impl RsaPod {
         sig: &SshSig,
         namespace: &str,
     ) -> Result<RsaPod> {
-        
         // Load signature
-        let (rsa_verify_target, rsa_circuit_data) = &*RSA_VERIFY_DATA;
+        let (rsa_pod_verify_target, rsa_pod_circuit_data) = &*RSA_POD_DATA;
         let mut pw = PartialWitness::<F>::new();
         let encoded_padded_data = build_ssh_signed_data(namespace, raw_msg.as_bytes(), sig)?;
     
@@ -86,26 +180,14 @@ impl RsaPod {
             KeyData::Rsa(pk) => pk,
             _ => {
                 return Err(Error::custom(String::from(
-                    "signature does not carry an Ed25519 key",
+                    "signature does not carry an Rsa key",
                 )));
             }
         };
+
         
-        set_rsa_targets(&mut pw, rsa_verify_target, sig, &encoded_padded_data)?;
-
-        let rsa_verify_proof = timed!(
-            "prove the rsa signature verification (RsaVerifyTarget)",
-            rsa_circuit_data.prove(pw)?
-        );
-
-
-        #[cfg(test)] // sanity check
-        {
-            rsa_circuit_data
-                .verifier_data()
-                .verify(rsa_verify_proof.clone())?;
-        }
         let pk_bytes = pk.n.as_positive_bytes().expect("Public key was negative").to_vec();
+
 
         let statements = pub_self_statements(&encoded_padded_data, &pk_bytes)
             .into_iter()
@@ -113,12 +195,35 @@ impl RsaPod {
             .collect_vec();
         let id: PodId = PodId(calculate_id(&statements, params));
 
+
+        let input = RsaPodVerifyInput {
+            vds_root,
+            id,
+            sig: sig,
+            padded_data: &encoded_padded_data
+        };
+
+        rsa_pod_verify_target.set_targets(&mut pw, &input)?;
+
+        let rsa_pod_verify_proof = timed!(
+            "prove the rsa signature verification (RsaVerifyTarget)",
+            rsa_pod_circuit_data.prove(pw)?
+        );
+
+        
+        #[cfg(test)] // sanity check
+        {
+            rsa_pod_circuit_data
+                .verifier_data()
+                .verify(rsa_pod_verify_proof.clone())?;
+        }
+
         Ok(RsaPod {
             params: params.clone(),
             id,
             msg: encoded_padded_data,
             pk: pk_bytes,
-            proof: rsa_verify_proof.proof,
+            proof: rsa_pod_verify_proof.proof,
             vds_hash: EMPTY_HASH,
         })
     }
@@ -134,9 +239,31 @@ impl RsaPod {
         Ok(Self::_prove(params, vds_root, raw_msg, sig, namespace).map(Box::new)?)
     }
 
-    fn _verify(&self/* TODO: args */) -> Result<()> {
-        // TODO: implement
-        panic!("RsaPod::_verify not implemented");
+    fn _verify(&self) -> Result<()> {
+        let statements = pub_self_statements(&self.msg, &self.pk)
+            .into_iter()
+            .map(mainpod::Statement::from)
+            .collect_vec();
+        let id: PodId = PodId(calculate_id(&statements, &self.params));
+        if id != self.id {
+            return Err(Error::id_not_equal(self.id, id));
+        }
+
+        let (_, circuit_data) = &*RSA_POD_DATA;
+
+        let public_inputs = id
+            .to_fields(&self.params)
+            .iter()
+            .chain(EMPTY_HASH.0.iter()) // slot for the unused vds root
+            .cloned()
+            .collect_vec();
+
+        circuit_data
+            .verify(ProofWithPublicInputs {
+                proof: self.proof.clone(),
+                public_inputs,
+            })
+            .map_err(|e| Error::custom(format!("Ed25519Pod proof verification failure: {:?}", e)))
     }
 }
 
@@ -172,6 +299,38 @@ fn type_statement() -> Statement {
     )
 }
 
+fn pub_self_statements_target(
+    builder: &mut CircuitBuilder<F, D>,
+    params: &Params,
+    msg: &[Target],
+    pk: &[Target],
+) -> Vec<StatementTarget> {
+    let st_type = StatementTarget::from_flattened(
+        params,
+        &builder.constants(&type_statement().to_fields(params)),
+    );
+
+    let ak_podid = builder.constant_value(RawValue::from(SELF.0));
+
+    // Hash the message
+    let msg_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(msg.to_vec());
+    let ak_key = builder.constant_value(Key::from(KEY_SIGNED_MSG).raw());
+    let ak_msg = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
+    let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&msg_hash.elements));
+    let st_msg =
+        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_msg, value]);
+
+    // Hash the public key
+    let pk_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(pk.to_vec());
+    let ak_key = builder.constant_value(Key::from(KEY_RSA_PK).raw());
+    let ak_pk = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
+    let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&pk_hash.elements));
+    let st_pk =
+        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_pk, value]);
+
+    vec![st_type, st_msg, st_pk]
+}
+
 fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement> {
     let st_type = type_statement();
 
@@ -196,6 +355,41 @@ fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement
     vec![st_type, st_msg, st_pk]
 }
 
+// Helper function to convert bit targets to byte targets
+fn le_bits_to_bytes_targets(builder: &mut CircuitBuilder<F, D>, bits: &Vec<BoolTarget>) -> Vec<Target> {
+    assert_eq!(bits.len() % 8, 0);
+    let mut bytes = Vec::new();
+
+    for chunk in bits.chunks(8) {
+
+        let byte_val = builder.le_sum(chunk.iter());
+
+        bytes.push(byte_val);
+    }
+
+    bytes.reverse();
+    bytes
+}
+
+fn biguint_to_bits_targets(builder: &mut CircuitBuilder<F, D>, biguint: &BigUintTarget, total_bits: usize) -> Vec<BoolTarget> {
+    // Returns bits in little-endian order, i.e. least significant BIT first (this is NOT the same as little endian BYTE ordering)
+    let false_target = builder._false();
+    let mut bits = Vec::new();
+    for limb in &biguint.limbs {
+        bits.extend_from_slice(&builder.split_le(*limb, BITS));
+    }
+
+    if bits.len() < total_bits {
+        bits.extend(vec![false_target; total_bits - bits.len()]);
+    } else if bits.len() > total_bits {
+        for i in total_bits..bits.len() {
+            let not_bit_i = builder.not(bits[i]);
+            builder.assert_bool(not_bit_i);
+        }
+        return bits[..total_bits].to_vec();
+    }
+    bits
+}
 
 /// Build SSH signed data format
 pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) -> Result<Vec<u8>> {
@@ -269,13 +463,13 @@ pub mod tests {
         return Ok(rsa_pod);
     }
 
-    #[test]
-    fn rsa_pod_only() -> Result<()> {
-        let rsa_pod = get_test_rsa_pod().unwrap();
-        Ok(())
-    }
+    //#[test]
+    //fn rsa_pod_only() -> Result<()> {
+    //    let _rsa_pod = get_test_rsa_pod().unwrap();
+    //    Ok(())
+    //}
 
-    #[ignore]
+
     #[test]
     fn rsa_pod_only_verify() -> Result<()> {
         

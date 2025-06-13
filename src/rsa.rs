@@ -3,10 +3,8 @@
  */
 
 
-use std::sync::LazyLock;
-
 use anyhow::anyhow;
-use num::{BigUint, Num};
+use num::BigUint;
 use plonky2::{
     field::types::Field,
     iop::{target::Target, witness::PartialWitness},
@@ -23,7 +21,7 @@ use ssh_key::{
 use pod2::backends::plonky2::basetypes::{D, F};
 
 pub(super) const BITS: usize = 27;
-type BigUintTarget = plonky2_rsa::gadgets::biguint::BigUintTarget<BITS>;
+pub type BigUintTarget = plonky2_rsa::gadgets::biguint::BigUintTarget<BITS>;
 
 pub(super) const RSA_LIMBS: usize = 4096usize.div_ceil(BITS);
 
@@ -89,8 +87,11 @@ pub fn rsa_example_public_key_2() -> PublicKey {
 pub fn build_rsa(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
     let signature = builder.add_virtual_biguint_target(RSA_LIMBS);
     let modulus = builder.add_virtual_biguint_target(RSA_LIMBS);
+    let computed_padded_data = pow_65537(builder, &signature, &modulus);
     let padded_data = builder.add_virtual_biguint_target(RSA_LIMBS);
+    builder.connect_biguint(&padded_data, &computed_padded_data);
     RSATargets { signature, modulus, padded_data }
+
 }
 
 pub fn is_rsa_key_supported(key: &RsaPublicKey) -> bool {
