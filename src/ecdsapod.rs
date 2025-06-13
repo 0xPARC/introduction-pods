@@ -10,7 +10,6 @@
 
 use std::sync::LazyLock;
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
 use num::bigint::BigUint;
 use plonky2::{
@@ -54,14 +53,16 @@ use pod2::{
         },
         mainpod,
         mainpod::calculate_id,
+        serialize_proof,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, EMPTY_HASH, F, Hash, KEY_TYPE, Key, NativePredicate, Params,
-        Pod, PodId, RawValue, RecursivePod, SELF, Statement, ToFields, Value,
+        self, AnchoredKey, DynError, F, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId,
+        RawValue, RecursivePod, SELF, Statement, ToFields, Value,
     },
     timed,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::PodType;
 
@@ -192,6 +193,7 @@ impl EcdsaPodVerifyTarget {
     }
 }
 
+/// EcdsaPod implements the trait RecursivePod
 #[derive(Clone, Debug)]
 pub struct EcdsaPod {
     params: Params,
@@ -199,9 +201,10 @@ pub struct EcdsaPod {
     msg: Secp256K1Scalar,
     pk: ECDSAPublicKey<Secp256K1>,
     proof: Proof,
-    vds_hash: Hash,
+    vds_root: Hash,
 }
-impl middleware::RecursivePod for EcdsaPod {
+
+impl RecursivePod for EcdsaPod {
     fn verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
         let (_, circuit_data) = &*STANDARD_ECDSA_POD_DATA;
         circuit_data.verifier_data().verifier_only
@@ -210,8 +213,43 @@ impl middleware::RecursivePod for EcdsaPod {
         self.proof.clone()
     }
     fn vds_root(&self) -> Hash {
-        self.vds_hash
+        self.vds_root
     }
+}
+
+impl Pod for EcdsaPod {
+    fn params(&self) -> &Params {
+        &self.params
+    }
+    fn verify(&self) -> Result<(), Box<DynError>> {
+        Ok(self._verify().map_err(Box::new)?)
+    }
+
+    fn id(&self) -> PodId {
+        self.id
+    }
+
+    fn pod_type(&self) -> (usize, &'static str) {
+        (PodType::Ecdsa as usize, "Ecdsa")
+    }
+
+    fn pub_self_statements(&self) -> Vec<middleware::Statement> {
+        pub_self_statements(self.msg, self.pk)
+    }
+
+    fn serialize_data(&self) -> serde_json::Value {
+        serde_json::to_value(Data {
+            proof: serialize_proof(&self.proof),
+            public_statements: self.pub_self_statements(),
+        })
+        .expect("serialization to json")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Data {
+    public_statements: Vec<Statement>,
+    proof: String,
 }
 
 static STANDARD_ECDSA_POD_DATA: LazyLock<(EcdsaPodVerifyTarget, CircuitData<F, C, D>)> =
@@ -288,7 +326,7 @@ impl EcdsaPod {
             msg,
             pk,
             proof: proof_with_pis.proof,
-            vds_hash: EMPTY_HASH,
+            vds_root,
         })
     }
 
@@ -328,29 +366,6 @@ impl EcdsaPod {
                 public_inputs,
             })
             .map_err(|e| Error::custom(format!("EcdsaPod proof verification failure: {:?}", e)))
-    }
-}
-impl Pod for EcdsaPod {
-    fn params(&self) -> &Params {
-        &self.params
-    }
-    fn verify(&self) -> Result<(), Box<DynError>> {
-        Ok(self._verify().map_err(Box::new)?)
-    }
-
-    fn id(&self) -> PodId {
-        self.id
-    }
-
-    fn pub_self_statements(&self) -> Vec<middleware::Statement> {
-        pub_self_statements(self.msg, self.pk)
-    }
-
-    fn serialized_proof(&self) -> String {
-        let mut buffer = Vec::new();
-        use plonky2::util::serialization::Write;
-        buffer.write_proof(&self.proof).unwrap();
-        BASE64_STANDARD.encode(buffer)
     }
 }
 
@@ -452,10 +467,12 @@ pub mod tests {
         ecdsa::{ECDSAPublicKey, ECDSASecretKey, ECDSASignature, sign_message},
         secp256k1::Secp256K1,
     };
-    use pod2::{self, frontend::MainPodBuilder, op};
+    use pod2::{self, frontend::MainPodBuilder, middleware::VDSet, op};
 
     use super::*;
 
+    /// test to ensure that the pub_self_statements methods match between the
+    /// in-circuit and the out-circuit implementations
     #[test]
     fn test_pub_self_statements_target() -> Result<()> {
         let params = &Default::default();
@@ -515,7 +532,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_ecdsa_pod_verify() -> Result<()> {
+    fn test_ecdsa_pod() -> Result<()> {
         // first generate all the circuits data so that it does not need to be
         // computed at further stages of the test (affecting the time reports)
         timed!(
@@ -540,10 +557,22 @@ pub mod tests {
             ECDSAPublicKey((CurveScalar(sk.0) * Secp256K1::GENERATOR_PROJECTIVE).to_affine());
         let signature: ECDSASignature<Secp256K1> = sign_message(msg, sk);
 
-        let vds_root = EMPTY_HASH;
+        let vds = vec![
+            pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA
+                .verifier_only
+                .clone(),
+            pod2::backends::plonky2::emptypod::STANDARD_EMPTY_POD_DATA
+                .1
+                .verifier_only
+                .clone(),
+            STANDARD_ECDSA_POD_DATA.1.verifier_only.clone(),
+        ];
+        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
+
+        // generate a new EcdsaPod from the given msg, pk, signature
         let ecdsa_pod = timed!(
             "EcdsaPod::new",
-            EcdsaPod::new(&params, vds_root, msg, pk, signature).unwrap()
+            EcdsaPod::new(&params, vdset.root(), msg, pk, signature).unwrap()
         );
 
         ecdsa_pod.verify().unwrap();
@@ -557,7 +586,7 @@ pub mod tests {
         };
 
         // now generate a new MainPod from the ecdsa_pod
-        let mut main_pod_builder = MainPodBuilder::new(&params);
+        let mut main_pod_builder = MainPodBuilder::new(&params, &vdset);
         main_pod_builder.add_main_pod(main_ecdsa_pod.clone());
 
         // add operation that ensures that the msg is as expected in the EcdsaPod
