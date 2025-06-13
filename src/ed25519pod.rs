@@ -1,7 +1,14 @@
-//ed25519pod.rs
+//! Implements the Ed25519Pod, a POD that proves that the given `pk` has signed
+//! the `msg` with the Ed25519 signature scheme.
+//!
+//! This POD is build through two steps:
+//! - first it generates a plonky2 proof of correct signature verification
+//! - then, verifies the previous proof in a new plonky2 proof, using the
+//!   `standard_recursion_config`, padded to match the `RecursiveCircuit<MainPod>`
+//!   configuration.
+
 use std::sync::LazyLock;
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
 use plonky2::{
     field::types::Field,
@@ -33,14 +40,16 @@ use pod2::{
         },
         mainpod,
         mainpod::calculate_id,
+        serialize_proof,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, EMPTY_HASH, F, Hash, KEY_TYPE, Key, NativePredicate, Params,
-        Pod, PodId, RawValue, SELF, Statement, ToFields, Value,
+        self, AnchoredKey, DynError, F, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId,
+        RawValue, RecursivePod, SELF, Statement, ToFields, Value,
     },
     timed,
 };
+use serde::{Deserialize, Serialize};
 use ssh_key::{SshSig, public::KeyData};
 
 use crate::PodType;
@@ -48,9 +57,10 @@ use crate::PodType;
 const KEY_SIGNED_MSG: &str = "signed_msg";
 const KEY_ED25519_PK: &str = "ed25519_pk";
 
-// Standard message length for ED25519 pods (can be made configurable)
+/// Standard message length for ED25519 pods (can be made configurable)
 const SIGNED_DATA_LEN: usize = 108; // SIGNED_DATA_LEN = 108 u8 = 864 bits
 
+/// targets and circuit_data of the circuit that verifies ed25519 signatures
 static ED25519_VERIFY_DATA: LazyLock<(EDDSATargets, CircuitData<F, C, D>)> =
     LazyLock::new(|| build_ed25519_verify().expect("successful build"));
 
@@ -63,6 +73,7 @@ fn build_ed25519_verify() -> Result<(EDDSATargets, CircuitData<F, C, D>)> {
     Ok((ed25519_verify_target, data))
 }
 
+/// Circuit verifies a proof generated from the Ed25519_VERIFY_DATA circuit
 #[derive(Clone, Debug)]
 struct Ed25519PodVerifyTarget {
     vds_root: HashOutTarget,
@@ -124,6 +135,7 @@ impl Ed25519PodVerifyTarget {
     }
 }
 
+/// Ed25519Pod mplements the trait RecursivePod
 #[derive(Clone, Debug)]
 pub struct Ed25519Pod {
     params: Params,
@@ -131,10 +143,10 @@ pub struct Ed25519Pod {
     msg: Vec<u8>,
     pk: Vec<u8>,
     proof: Proof,
-    vds_hash: Hash,
+    vds_root: Hash,
 }
 
-impl middleware::RecursivePod for Ed25519Pod {
+impl RecursivePod for Ed25519Pod {
     fn verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
         let (_, circuit_data) = &*STANDARD_ED25519_POD_DATA;
         circuit_data.verifier_data().verifier_only
@@ -143,8 +155,44 @@ impl middleware::RecursivePod for Ed25519Pod {
         self.proof.clone()
     }
     fn vds_root(&self) -> Hash {
-        self.vds_hash
+        self.vds_root
     }
+}
+
+impl Pod for Ed25519Pod {
+    fn params(&self) -> &Params {
+        &self.params
+    }
+
+    fn verify(&self) -> Result<(), Box<DynError>> {
+        Ok(self._verify().map_err(Box::new)?)
+    }
+
+    fn id(&self) -> PodId {
+        self.id
+    }
+
+    fn pod_type(&self) -> (usize, &'static str) {
+        (PodType::Ed25519 as usize, "Ed25519")
+    }
+
+    fn pub_self_statements(&self) -> Vec<middleware::Statement> {
+        pub_self_statements(&self.msg, &self.pk)
+    }
+
+    fn serialize_data(&self) -> serde_json::Value {
+        serde_json::to_value(Data {
+            proof: serialize_proof(&self.proof),
+            public_statements: self.pub_self_statements(),
+        })
+        .expect("serialization to json")
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Data {
+    public_statements: Vec<Statement>,
+    proof: String,
 }
 
 static STANDARD_ED25519_POD_DATA: LazyLock<(Ed25519PodVerifyTarget, CircuitData<F, C, D>)> =
@@ -240,7 +288,7 @@ impl Ed25519Pod {
             msg: signed_data,
             pk: pk.as_ref().to_vec(),
             proof: proof_with_pis.proof,
-            vds_hash: EMPTY_HASH,
+            vds_root,
         })
     }
 
@@ -270,7 +318,7 @@ impl Ed25519Pod {
         let public_inputs = id
             .to_fields(&self.params)
             .iter()
-            .chain(EMPTY_HASH.0.iter()) // slot for the unused vds root
+            .chain(self.vds_root().0.iter())
             .cloned()
             .collect_vec();
 
@@ -280,31 +328,6 @@ impl Ed25519Pod {
                 public_inputs,
             })
             .map_err(|e| Error::custom(format!("Ed25519Pod proof verification failure: {:?}", e)))
-    }
-}
-
-impl Pod for Ed25519Pod {
-    fn params(&self) -> &Params {
-        &self.params
-    }
-
-    fn verify(&self) -> Result<(), Box<DynError>> {
-        Ok(self._verify().map_err(Box::new)?)
-    }
-
-    fn id(&self) -> PodId {
-        self.id
-    }
-
-    fn pub_self_statements(&self) -> Vec<middleware::Statement> {
-        pub_self_statements(&self.msg, &self.pk)
-    }
-
-    fn serialized_proof(&self) -> String {
-        let mut buffer = Vec::new();
-        use plonky2::util::serialization::Write;
-        buffer.write_proof(&self.proof).unwrap();
-        BASE64_STANDARD.encode(buffer)
     }
 }
 
@@ -371,6 +394,7 @@ fn pub_self_statements_target(
     vec![st_type, st_msg, st_pk]
 }
 
+// compatible with the same method in-circuit (pub_self_statements_target)
 fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
     let st_type = type_statement();
 
@@ -399,12 +423,13 @@ fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
 pub mod tests {
     use std::any::Any;
 
-    use pod2::{self, frontend::MainPodBuilder, op};
+    use pod2::{self, frontend::MainPodBuilder, middleware::VDSet, op};
     use ssh_key::SshSig;
 
     use super::*;
 
     #[test]
+    #[ignore] // This is for the GitHub CI, it takes too long and the CI would fail.
     fn test_ed25519_pod_with_mainpod_verify() -> Result<()> {
         let params = Params {
             max_input_signed_pods: 0,
@@ -415,11 +440,22 @@ pub mod tests {
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
-        let vds_root = EMPTY_HASH;
+
+        let vds = vec![
+            pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA
+                .verifier_only
+                .clone(),
+            pod2::backends::plonky2::emptypod::STANDARD_EMPTY_POD_DATA
+                .1
+                .verifier_only
+                .clone(),
+            STANDARD_ED25519_POD_DATA.1.verifier_only.clone(),
+        ];
+        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
 
         let ed25519_pod = timed!(
             "Ed25519Pod::new",
-            Ed25519Pod::new(&params, vds_root, msg, &sig, namespace).unwrap()
+            Ed25519Pod::new(&params, vdset.root(), msg, &sig, namespace).unwrap()
         );
 
         ed25519_pod.verify().unwrap();
@@ -434,7 +470,7 @@ pub mod tests {
         };
 
         // now generate a new MainPod from the ed25519_pod
-        let mut main_pod_builder = MainPodBuilder::new(&params);
+        let mut main_pod_builder = MainPodBuilder::new(&params, &vdset);
         main_pod_builder.add_main_pod(main_ed25519_pod.clone());
 
         // add operation that ensures that the msg is as expected in the EcdsaPod
@@ -484,7 +520,9 @@ pub mod tests {
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
-        let vds_root = EMPTY_HASH;
+        // since the pod in this test will not be checked in a MainPod, we can
+        // set the vds_root to empty
+        let vds_root = pod2::middleware::EMPTY_HASH;
 
         let ed25519_pod = timed!(
             "Ed25519Pod::new",
