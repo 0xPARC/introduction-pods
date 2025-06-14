@@ -446,6 +446,9 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use std::any::Any;
+
+    use pod2::{self, frontend::MainPodBuilder};
 
     fn get_test_rsa_pod() -> Result<Box<dyn Pod>, Box<DynError>> {
         let params = Params {
@@ -472,6 +475,42 @@ pub mod tests {
         
         let rsa_pod = get_test_rsa_pod().unwrap();
         rsa_pod.verify().unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rsa_pod_with_mainpod_verify() -> Result<()> {
+        let rsa_pod = get_test_rsa_pod().unwrap();
+
+        rsa_pod.verify().unwrap();
+
+        let params = rsa_pod.params().clone();
+
+        // wrap the rsa_pod in a 'MainPod' (RecursivePod)
+        let main_rsa_pod = pod2::frontend::MainPod {
+            pod: (rsa_pod.clone() as Box<dyn Any>)
+                .downcast::<RsaPod>()
+                .unwrap(),
+            public_statements: rsa_pod.pub_statements(),
+            params: params.clone(),
+        };
+
+        // now generate a new MainPod from the rsa_pod
+        let mut main_pod_builder = MainPodBuilder::new(&params);
+        main_pod_builder.add_main_pod(main_rsa_pod);
+
+        let mut prover = pod2::backends::plonky2::mock::mainpod::MockProver {};
+        let pod = main_pod_builder.prove(&mut prover, &params).unwrap();
+        assert!(pod.pod.verify().is_ok());
+
+        println!("going to prove the main_pod");
+        let mut prover = mainpod::Prover {};
+        let main_pod = main_pod_builder.prove(&mut prover, &params).unwrap();
+        let pod = (main_pod.pod as Box<dyn Any>)
+            .downcast::<mainpod::MainPod>()
+            .unwrap();
+        pod.verify().unwrap();
 
         Ok(())
     }
