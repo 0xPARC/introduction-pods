@@ -51,7 +51,7 @@ use pod2::{
             },
             mainpod::CalculateIdGadget,
         },
-        mainpod,
+        deserialize_proof, mainpod,
         mainpod::calculate_id,
         serialize_proof,
     },
@@ -240,15 +240,39 @@ impl Pod for EcdsaPod {
     fn serialize_data(&self) -> serde_json::Value {
         serde_json::to_value(Data {
             proof: serialize_proof(&self.proof),
-            public_statements: self.pub_self_statements(),
+            msg: self.msg,
+            pk: self.pk,
         })
         .expect("serialization to json")
+    }
+}
+impl EcdsaPod {
+    // TODO: once https://github.com/0xPARC/pod2/issues/294 is done, this method
+    // will be part of the trait, not a custom impl.
+    fn deserialize(
+        params: Params,
+        id: PodId,
+        vds_root: Hash,
+        data: serde_json::Value,
+    ) -> Result<Box<dyn RecursivePod>> {
+        let data: Data = serde_json::from_value(data)?;
+        let common = crate::get_common_data(&params)?;
+        let proof = deserialize_proof(&common, &data.proof)?;
+        Ok(Box::new(Self {
+            params,
+            id,
+            msg: data.msg,
+            pk: data.pk,
+            proof,
+            vds_root,
+        }))
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Data {
-    public_statements: Vec<Statement>,
+    msg: Secp256K1Scalar,
+    pk: ECDSAPublicKey<Secp256K1>,
     proof: String,
 }
 
