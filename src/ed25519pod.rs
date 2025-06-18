@@ -39,7 +39,7 @@ use pod2::{
             mainpod::CalculateIdGadget,
         },
         deserialize_proof, mainpod,
-        mainpod::calculate_id,
+        mainpod::{calculate_id, get_common_data},
         serialize_proof,
     },
     measure_gates_begin, measure_gates_end,
@@ -157,6 +157,24 @@ impl RecursivePod for Ed25519Pod {
     fn vds_root(&self) -> Hash {
         self.vds_root
     }
+    fn deserialize_data(
+        params: Params,
+        data: serde_json::Value,
+        vds_root: Hash,
+        id: PodId,
+    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
+        let data: Data = serde_json::from_value(data)?;
+        let common = get_common_data(&params)?;
+        let proof = deserialize_proof(&common, &data.proof)?;
+        Ok(Box::new(Self {
+            params,
+            id,
+            msg: data.msg,
+            pk: data.pk,
+            proof,
+            vds_root,
+        }))
+    }
 }
 
 impl Pod for Ed25519Pod {
@@ -187,28 +205,6 @@ impl Pod for Ed25519Pod {
             pk: self.pk.clone(),
         })
         .expect("serialization to json")
-    }
-}
-impl Ed25519Pod {
-    // TODO: once https://github.com/0xPARC/pod2/issues/294 is done, this method
-    // will be part of the trait, not a custom impl.
-    fn deserialize(
-        params: Params,
-        id: PodId,
-        vds_root: Hash,
-        data: serde_json::Value,
-    ) -> Result<Box<dyn RecursivePod>> {
-        let data: Data = serde_json::from_value(data)?;
-        let common = crate::get_common_data(&params)?;
-        let proof = deserialize_proof(&common, &data.proof)?;
-        Ok(Box::new(Self {
-            params,
-            id,
-            msg: data.msg,
-            pk: data.pk,
-            proof,
-            vds_root,
-        }))
     }
 }
 
@@ -380,7 +376,7 @@ fn bits_to_bytes_targets(builder: &mut CircuitBuilder<F, D>, bits: &[Target]) ->
 }
 
 fn type_statement() -> Statement {
-    Statement::ValueOf(
+    Statement::equal(
         AnchoredKey::from((SELF, KEY_TYPE)),
         Value::from(PodType::Ed25519),
     )
@@ -405,7 +401,7 @@ fn pub_self_statements_target(
     let ak_msg = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&msg_hash.elements));
     let st_msg =
-        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_msg, value]);
+        StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak_msg, value]);
 
     // Hash the public key
     let pk_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(pk.to_vec());
@@ -413,7 +409,7 @@ fn pub_self_statements_target(
     let ak_pk = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&pk_hash.elements));
     let st_pk =
-        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_pk, value]);
+        StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak_pk, value]);
 
     vec![st_type, st_msg, st_pk]
 }
@@ -426,7 +422,7 @@ fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
     let msg_fields: Vec<F> = msg.iter().map(|&b| F::from_canonical_u8(b)).collect();
     let msg_hash = PoseidonHash::hash_no_pad(&msg_fields);
 
-    let st_msg = Statement::ValueOf(
+    let st_msg = Statement::equal(
         AnchoredKey::from((SELF, KEY_SIGNED_MSG)),
         Value::from(RawValue(msg_hash.elements)),
     );
@@ -435,7 +431,7 @@ fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
     let pk_fields: Vec<F> = pk.iter().map(|&b| F::from_canonical_u8(b)).collect();
     let pk_hash = PoseidonHash::hash_no_pad(&pk_fields);
 
-    let st_pk = Statement::ValueOf(
+    let st_pk = Statement::equal(
         AnchoredKey::from((SELF, KEY_ED25519_PK)),
         Value::from(RawValue(pk_hash.elements)),
     );
@@ -507,7 +503,8 @@ pub mod tests {
         let msg_copy = main_pod_builder
             .pub_op(op!(
                 new_entry,
-                (KEY_SIGNED_MSG, Value::from(RawValue(msg_hash.elements)))
+                KEY_SIGNED_MSG,
+                Value::from(RawValue(msg_hash.elements))
             ))
             .unwrap();
         main_pod_builder
