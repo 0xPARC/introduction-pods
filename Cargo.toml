@@ -17,6 +17,12 @@ plonky2_ecdsa = {git = "https://github.com/ax0/plonky2-ecdsa"}
 num = { version = "0.4.0", default-features = false }
 plonky2_ed25519 = {git = "https://github.com/ainta/plonky2-ed25519"}
 ssh-key = { version = "0.6.7", features = ["ed25519"] }
+memchr = "2.7.5"
+ciborium = "0.2.2"
+serde = "1.0.219"
+
+[dev-dependencies]
+rand = "0.8.5"
 
 [features]
 default = []
