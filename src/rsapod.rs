@@ -1,94 +1,70 @@
 use std::sync::LazyLock;
 
-use base64::{
-    Engine, prelude::BASE64_STANDARD
-};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
-use pod2::{
-    backends::plonky2::{
-        basetypes::{
-            C, D
-        },
-        mainpod::{
-            self, calculate_id
-        },
-        circuits::{
-            mainpod::CalculateIdGadget,
-            common::{
-                StatementTarget, StatementArgTarget, ValueTarget, CircuitBuilderPod, Flattenable
-            }
-        },
-        Error,
-        Result
-    },
-    middleware::{
-        self, AnchoredKey, DynError, Hash, Params, Pod, PodId, Proof, RawValue, Value, F, Statement, EMPTY_HASH, SELF, KEY_TYPE, ToFields, NativePredicate, Key
-    }, 
-    timed
-};
 use plonky2::{
     field::types::Field,
     hash::{
+        hash_types::{HashOut, HashOutTarget},
         poseidon::PoseidonHash,
-        hash_types::{
-            HashOutTarget, HashOut
-        }
     },
     iop::{
-        witness::{
-            PartialWitness, WitnessWrite
-        },
-        target::{
-            Target, BoolTarget
-        }
+        target::{BoolTarget, Target},
+        witness::{PartialWitness, WitnessWrite},
     },
     plonk::{
-        config::Hasher,
         circuit_builder::CircuitBuilder,
-        circuit_data::{
-            CircuitConfig, CircuitData, VerifierOnlyCircuitData
-        },
-        proof::{
-            ProofWithPublicInputs
-        }
-    }
+        circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData},
+        config::Hasher,
+        proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
+    },
 };
+use pod2::{
+    backends::plonky2::{
+        Error, Result,
+        basetypes::{C, D},
+        circuits::{
+            common::{
+                CircuitBuilderPod, Flattenable, StatementArgTarget, StatementTarget, ValueTarget,
+            },
+            mainpod::CalculateIdGadget,
+        },
+        mainpod::{self, calculate_id},
+    },
+    measure_gates_begin, measure_gates_end,
+    middleware::{
+        self, AnchoredKey, DynError, EMPTY_HASH, F, Hash, KEY_TYPE, Key, NativePredicate, Params,
+        Pod, PodId, Proof, RawValue, SELF, Statement, ToFields, Value,
+    },
+    timed,
+};
+use sha2::{Digest, Sha256, Sha512};
+use ssh_key::{Algorithm, HashAlg, SshSig, public::KeyData};
+
 use crate::{
     PodType,
-    rsa::{
-        RSATargets, build_rsa, set_rsa_targets, BigUintTarget, BITS
-    }
-};
-use ssh_key::{
-    public::KeyData, Algorithm, HashAlg, SshSig
-};
-use sha2::{
-    Sha512, Sha256, Digest
+    rsa::{BITS, BigUintTarget, RSA_LIMBS, RSATargets, build_rsa, set_rsa_targets},
 };
 
 const RSA_BYTE_SIZE: usize = 512;
 
 const KEY_SIGNED_MSG: &str = "signed_msg"; // TODO indicate signing algorithm? bit size?
 const KEY_RSA_PK: &str = "rsa_pk"; // TODO indicate bit size?
-/*
-fn make_verify_circuits(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
-    return build_rsa(builder);
-}
- */
-// Standard message length for ED25519 pods (can be made configurable)
-// const SIGNED_DATA_LEN: usize = 108; // SIGNED_DATA_LEN = 108 u8 = 864 bits
 
-static RSA_POD_DATA: LazyLock<(RsaPodVerifyTarget, CircuitData<F, C, D>)> =
-    LazyLock::new(|| build().expect("successful build"));
+static RSA_VERIFY_DATA: LazyLock<(RSATargets, CircuitData<F, C, D>)> =
+    LazyLock::new(|| build_rsa_verify().expect("successful build"));
 
-fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
-    let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
+fn build_rsa_verify() -> Result<(RSATargets, CircuitData<F, C, D>)> {
     let config = CircuitConfig::standard_recursion_config(); // TODO is this the right config?
     let mut builder = CircuitBuilder::<F, D>::new(config);
-    let rsa_pod_verify_target = RsaPodVerifyTarget::add_targets(&mut builder, params);
+    let rsa_pod_verify_target = build_rsa(&mut builder);
 
+    // Register public inputs
+    builder.register_public_inputs(&rsa_pod_verify_target.signature.limbs);
+    builder.register_public_inputs(&rsa_pod_verify_target.modulus.limbs);
+    builder.register_public_inputs(&rsa_pod_verify_target.padded_data.limbs);
 
-    let data = timed!("Ed25519Verify build", builder.build::<C>());
+    let data = timed!("RSAVerify build", builder.build::<C>());
     Ok((rsa_pod_verify_target, data))
 }
 
@@ -96,47 +72,65 @@ fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
 struct RsaPodVerifyTarget {
     vds_root: HashOutTarget,
     id: HashOutTarget,
-    rsa_verify_target: RSATargets,
+    proof: ProofWithPublicInputsTarget<D>,
+}
+
+struct RsaPodVerifyInput {
+    vds_root: Hash,
+    id: PodId,
+    proof: ProofWithPublicInputs<F, C, D>,
 }
 
 impl RsaPodVerifyTarget {
     fn add_targets(builder: &mut CircuitBuilder<F, D>, params: &Params) -> Self {
-        let vds_root = builder.add_virtual_hash();
-        let rsa_verify_target = build_rsa(builder);
+        let measure = measure_gates_begin!(builder, "RsaPodVerifyTarget");
 
-        
-        let msg_bits = biguint_to_bits_targets(builder, &rsa_verify_target.padded_data, 8 * RSA_BYTE_SIZE);
+        // Verify proof of RSA verification
+        let (_, circuit_data) = &*RSA_VERIFY_DATA;
+        let verifier_data_targ = builder.constant_verifier_data(&circuit_data.verifier_only);
+        let proof_targ = builder.add_virtual_proof_with_pis(&circuit_data.common);
+        builder.verify_proof::<C>(&proof_targ, &verifier_data_targ, &circuit_data.common);
+
+        // Extract message & public key
+        let msg = BigUintTarget {
+            limbs: proof_targ.public_inputs[2 * RSA_LIMBS..].to_vec(),
+        };
+        let modulus = BigUintTarget {
+            limbs: proof_targ.public_inputs[RSA_LIMBS..2 * RSA_LIMBS].to_vec(),
+        };
+
+        // Form statements
+        let msg_bits = biguint_to_bits_targets(builder, &msg, 8 * RSA_BYTE_SIZE);
         let msg_bytes = le_bits_to_bytes_targets(builder, &msg_bits);
-        let modulus_bits = biguint_to_bits_targets(builder, &rsa_verify_target.modulus, 8 * RSA_BYTE_SIZE);
+        let modulus_bits = biguint_to_bits_targets(builder, &modulus, 8 * RSA_BYTE_SIZE);
         let modulus_bytes = le_bits_to_bytes_targets(builder, &modulus_bits);
 
-        
         let statements = pub_self_statements_target(builder, params, &msg_bytes, &modulus_bytes);
         let id = CalculateIdGadget {
             params: params.clone(),
         }
         .eval(builder, &statements);
 
+        // Register public inputs
+        let vds_root = builder.add_virtual_hash();
         builder.register_public_inputs(&id.elements);
         builder.register_public_inputs(&vds_root.elements);
 
-        Self { vds_root, id, rsa_verify_target}
+        measure_gates_end!(builder, measure);
+        Self {
+            vds_root,
+            id,
+            proof: proof_targ,
+        }
     }
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &RsaPodVerifyInput) -> Result<()> {
-        set_rsa_targets(pw, &self.rsa_verify_target, &input.sig, &input.padded_data)?;
+        pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
         pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
         pw.set_target_arr(&self.vds_root.elements, &input.vds_root.0)?;
 
         Ok(())
     }
-}
-
-pub struct RsaPodVerifyInput<'a> {
-    vds_root: Hash,
-    id: PodId,
-    sig: &'a SshSig,
-    padded_data: &'a Vec<u8>
 }
 
 #[derive(Clone, Debug)]
@@ -151,7 +145,7 @@ pub struct RsaPod {
 
 impl middleware::RecursivePod for RsaPod {
     fn verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
-        let (_, circuit_data) = &*RSA_POD_DATA;
+        let (_, circuit_data) = &*STANDARD_RSA_POD_DATA;
         circuit_data.verifier_data().verifier_only
     }
     fn proof(&self) -> Proof {
@@ -162,6 +156,22 @@ impl middleware::RecursivePod for RsaPod {
     }
 }
 
+static STANDARD_RSA_POD_DATA: LazyLock<(RsaPodVerifyTarget, CircuitData<F, C, D>)> =
+    LazyLock::new(|| build().expect("successful build"));
+
+fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
+    let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
+    let config = CircuitConfig::standard_recursion_config();
+    let mut builder = CircuitBuilder::<F, D>::new(config);
+    let rsa_pod_verify_target = RsaPodVerifyTarget::add_targets(&mut builder, params);
+    let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
+    pod2::backends::plonky2::recursion::pad_circuit(&mut builder, &rec_circuit_data.common);
+
+    let data = timed!("RSAPod build", builder.build::<C>());
+    assert_eq!(rec_circuit_data.common, data.common);
+    Ok((rsa_pod_verify_target, data))
+}
+
 impl RsaPod {
     fn _prove(
         params: &Params,
@@ -170,11 +180,11 @@ impl RsaPod {
         sig: &SshSig,
         namespace: &str,
     ) -> Result<RsaPod> {
-        // Load signature
-        let (rsa_pod_verify_target, rsa_pod_circuit_data) = &*RSA_POD_DATA;
+        // Load signature into verification circuit
+        let (rsa_verify_target, rsa_circuit_data) = &*RSA_VERIFY_DATA;
         let mut pw = PartialWitness::<F>::new();
         let encoded_padded_data = build_ssh_signed_data(namespace, raw_msg.as_bytes(), sig)?;
-    
+
         let pk = match sig.public_key() {
             KeyData::Rsa(pk) => pk,
             _ => {
@@ -184,14 +194,25 @@ impl RsaPod {
             }
         };
 
-        
-        let pk_bytes = pk.n.as_positive_bytes().expect("Public key was negative").to_vec();
+        let pk_bytes =
+            pk.n.as_positive_bytes()
+                .expect("Public key was negative")
+                .to_vec();
         if pk_bytes.len() != RSA_BYTE_SIZE {
             return Err(Error::custom(String::from(
                 "Public key was not the correct size",
             )));
         }
 
+        set_rsa_targets(&mut pw, rsa_verify_target, sig, &encoded_padded_data)?;
+
+        let rsa_verify_proof = timed!(
+            "prove the RSA signature verification (RSAVerifyTarget)",
+            rsa_circuit_data.prove(pw)?
+        );
+
+        // Verify in wrapped circuit
+        let (rsa_pod_target, circuit_data) = &*STANDARD_RSA_POD_DATA;
 
         let statements = pub_self_statements(&encoded_padded_data, &pk_bytes)
             .into_iter()
@@ -199,27 +220,25 @@ impl RsaPod {
             .collect_vec();
         let id: PodId = PodId(calculate_id(&statements, params));
 
-
+        // Set targets
         let input = RsaPodVerifyInput {
             vds_root,
             id,
-            sig: sig,
-            padded_data: &encoded_padded_data
+            proof: rsa_verify_proof,
         };
 
-        rsa_pod_verify_target.set_targets(&mut pw, &input)?;
-
-        let rsa_pod_verify_proof = timed!(
-            "prove the rsa signature verification (RsaVerifyTarget)",
-            rsa_pod_circuit_data.prove(pw)?
+        let mut pw = PartialWitness::<F>::new();
+        rsa_pod_target.set_targets(&mut pw, &input)?;
+        let proof_with_pis = timed!(
+            "prove the ed25519-verification proof verification (Ed25519Pod proof)",
+            circuit_data.prove(pw)?
         );
 
-        
         #[cfg(test)] // sanity check
         {
-            rsa_pod_circuit_data
+            circuit_data
                 .verifier_data()
-                .verify(rsa_pod_verify_proof.clone())?;
+                .verify(proof_with_pis.clone())?;
         }
 
         Ok(RsaPod {
@@ -227,7 +246,7 @@ impl RsaPod {
             id,
             msg: encoded_padded_data,
             pk: pk_bytes,
-            proof: rsa_pod_verify_proof.proof,
+            proof: proof_with_pis.proof,
             vds_hash: EMPTY_HASH,
         })
     }
@@ -253,7 +272,7 @@ impl RsaPod {
             return Err(Error::id_not_equal(self.id, id));
         }
 
-        let (_, circuit_data) = &*RSA_POD_DATA;
+        let (_, circuit_data) = &*STANDARD_RSA_POD_DATA;
 
         let public_inputs = id
             .to_fields(&self.params)
@@ -267,7 +286,7 @@ impl RsaPod {
                 proof: self.proof.clone(),
                 public_inputs,
             })
-            .map_err(|e| Error::custom(format!("Ed25519Pod proof verification failure: {:?}", e)))
+            .map_err(|e| Error::custom(format!("RSAPod proof verification failure: {:?}", e)))
     }
 }
 
@@ -360,12 +379,14 @@ fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement
 }
 
 // Helper function to convert bit targets to byte targets
-fn le_bits_to_bytes_targets(builder: &mut CircuitBuilder<F, D>, bits: &Vec<BoolTarget>) -> Vec<Target> {
+fn le_bits_to_bytes_targets(
+    builder: &mut CircuitBuilder<F, D>,
+    bits: &Vec<BoolTarget>,
+) -> Vec<Target> {
     assert_eq!(bits.len() % 8, 0);
     let mut bytes = Vec::new();
 
     for chunk in bits.chunks(8) {
-
         let byte_val = builder.le_sum(chunk.iter());
 
         bytes.push(byte_val);
@@ -375,7 +396,11 @@ fn le_bits_to_bytes_targets(builder: &mut CircuitBuilder<F, D>, bits: &Vec<BoolT
     bytes
 }
 
-fn biguint_to_bits_targets(builder: &mut CircuitBuilder<F, D>, biguint: &BigUintTarget, total_bits: usize) -> Vec<BoolTarget> {
+fn biguint_to_bits_targets(
+    builder: &mut CircuitBuilder<F, D>,
+    biguint: &BigUintTarget,
+    total_bits: usize,
+) -> Vec<BoolTarget> {
     // Returns bits in little-endian order, i.e. least significant BIT first (this is NOT the same as little endian BYTE ordering)
     let false_target = builder._false();
     let mut bits = Vec::new();
@@ -402,42 +427,48 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
         .expect("failed to build encoded SSH data");
 
     // Hash the data to sign and generate the digest info
-    let (hashed_data, digest_info) : (Vec<u8>, Vec<u8>) = match ssh_sig.algorithm() {
-        Algorithm::Rsa { hash: Some(HashAlg::Sha256) } => (
-            Sha256::digest(&encoded_data).to_vec(),
-            vec![
-                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20
-            ]
-        ),
-        Algorithm::Rsa { hash: Some(HashAlg::Sha512) } => (
-            Sha512::digest(&encoded_data).to_vec(),
-            vec![
-                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40
-            ]
-        ),
-        _ => return Err(Error::custom(String::from("rsa-sha2-256 and rsa-sha2-256 only"))),
+    let (hashed_data, digest_info): (Vec<u8>, Vec<u8>) = match ssh_sig.algorithm() {
+        Algorithm::Rsa {
+            hash: Some(HashAlg::Sha256),
+        } => (Sha256::digest(&encoded_data).to_vec(), vec![
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x01, 0x05, 0x00, 0x04, 0x20,
+        ]),
+        Algorithm::Rsa {
+            hash: Some(HashAlg::Sha512),
+        } => (Sha512::digest(&encoded_data).to_vec(), vec![
+            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x03, 0x05, 0x00, 0x04, 0x40,
+        ]),
+        _ => {
+            return Err(Error::custom(String::from(
+                "rsa-sha2-256 and rsa-sha2-256 only",
+            )));
+        }
     };
-    
+
     let mut combined_data = digest_info;
     combined_data.extend_from_slice(&hashed_data);
 
     let comb_len = combined_data.len();
 
     if RSA_BYTE_SIZE < comb_len + 11 {
-        return Err(Error::custom(String::from("Internal encoding error. Encoded message overflows modulus.")))
+        return Err(Error::custom(String::from(
+            "Internal encoding error. Encoded message overflows modulus.",
+        )));
     }
 
     // Generate padding string PS
     let ps_len = RSA_BYTE_SIZE - comb_len - 3;
     let ps = vec![0xff; ps_len]; // PS consists of 0xff octets
-    
+
     // Step 5: Concatenate to form the encoded message EM
     // EM = 0x00 || 0x01 || PS || 0x00 || T
     let mut padded_data = Vec::with_capacity(RSA_BYTE_SIZE);
-    padded_data.push(0x00);           // Leading 0x00
-    padded_data.push(0x01);           // 0x01 byte
+    padded_data.push(0x00); // Leading 0x00
+    padded_data.push(0x01); // 0x01 byte
     padded_data.extend_from_slice(&ps); // Padding string PS (all 0xff)
-    padded_data.push(0x00);           // Separator 0x00
+    padded_data.push(0x00); // Separator 0x00
     padded_data.extend_from_slice(&combined_data); // DigestInfo T
 
     Ok(padded_data)
@@ -445,10 +476,11 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
     use std::any::Any;
 
     use pod2::{self, frontend::MainPodBuilder};
+
+    use super::*;
 
     fn get_test_rsa_pod() -> Result<Box<dyn Pod>, Box<DynError>> {
         let params = Params {
@@ -461,18 +493,16 @@ pub mod tests {
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/id_rsa_example.sig")).unwrap();
         let vds_root = EMPTY_HASH;
-    
 
         let rsa_pod = timed!(
             "RsaPod::new",
             RsaPod::new(&params, vds_root, msg, &sig, namespace).unwrap()
         );
-        return Ok(rsa_pod);
+        Ok(rsa_pod)
     }
 
     #[test]
     fn rsa_pod_only_verify() -> Result<()> {
-        
         let rsa_pod = get_test_rsa_pod().unwrap();
         rsa_pod.verify().unwrap();
 
@@ -482,7 +512,6 @@ pub mod tests {
     #[test]
     fn test_rsa_pod_with_mainpod_verify() -> Result<()> {
         let rsa_pod = get_test_rsa_pod().unwrap();
-
         rsa_pod.verify().unwrap();
 
         let params = rsa_pod.params().clone();
@@ -524,9 +553,38 @@ pub mod tests {
         let data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig).unwrap();
 
         assert_eq!(data, vec![
-            0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 48, 81, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 3, 5, 0, 4, 64, 181, 197, 44, 214, 116, 75, 54, 39, 234, 42, 140, 208, 11, 206, 41, 35, 206, 205, 191, 120, 173, 54, 59, 138, 2, 32, 227, 203, 41, 241, 18, 139, 161, 89, 68, 192, 135, 58, 241, 130, 136, 20, 149, 230, 135, 249, 125, 234, 20, 202, 101, 48, 221, 110, 27, 245, 17, 102, 82, 107, 69, 88, 89, 51
+            0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 0, 48, 81, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 3, 5, 0, 4, 64, 181,
+            197, 44, 214, 116, 75, 54, 39, 234, 42, 140, 208, 11, 206, 41, 35, 206, 205, 191, 120,
+            173, 54, 59, 138, 2, 32, 227, 203, 41, 241, 18, 139, 161, 89, 68, 192, 135, 58, 241,
+            130, 136, 20, 149, 230, 135, 249, 125, 234, 20, 202, 101, 48, 221, 110, 27, 245, 17,
+            102, 82, 107, 69, 88, 89, 51
         ]);
-        
+
         Ok(())
     }
 }
