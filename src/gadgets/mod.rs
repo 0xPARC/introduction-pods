@@ -1,2 +1,3 @@
+pub mod hash_var_len;
 pub mod search;
-pub mod varlen;
+pub mod shift;
