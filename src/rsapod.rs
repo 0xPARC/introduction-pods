@@ -48,14 +48,14 @@ use crate::{
 
 const RSA_BYTE_SIZE: usize = 512;
 
-const KEY_SIGNED_MSG: &str = "signed_msg"; // TODO indicate signing algorithm? bit size?
-const KEY_RSA_PK: &str = "rsa_pk"; // TODO indicate bit size?
+const KEY_SIGNED_MSG: &str = "signed_msg";
+const KEY_RSA_PK: &str = "rsa_pk";
 
 static RSA_VERIFY_DATA: LazyLock<(RSATargets, CircuitData<F, C, D>)> =
     LazyLock::new(|| build_rsa_verify().expect("successful build"));
 
 fn build_rsa_verify() -> Result<(RSATargets, CircuitData<F, C, D>)> {
-    let config = CircuitConfig::standard_recursion_config(); // TODO is this the right config?
+    let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let rsa_pod_verify_target = build_rsa(&mut builder);
 
@@ -175,7 +175,7 @@ fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
 impl RsaPod {
     fn _prove(
         params: &Params,
-        vds_root: Hash, // TODO what is this?
+        vds_root: Hash,
         raw_msg: &str,
         sig: &SshSig,
         namespace: &str,
@@ -462,7 +462,7 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
     let ps_len = RSA_BYTE_SIZE - comb_len - 3;
     let ps = vec![0xff; ps_len]; // PS consists of 0xff octets
 
-    // Step 5: Concatenate to form the encoded message EM
+    // Concatenate to form the encoded message EM
     // EM = 0x00 || 0x01 || PS || 0x00 || T
     let mut padded_data = Vec::with_capacity(RSA_BYTE_SIZE);
     padded_data.push(0x00); // Leading 0x00
@@ -502,6 +502,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore] // This test is a subset of rsa_pod_with_mainpod_verify
     fn rsa_pod_only_verify() -> Result<()> {
         let rsa_pod = get_test_rsa_pod().unwrap();
         rsa_pod.verify().unwrap();
@@ -510,7 +511,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_rsa_pod_with_mainpod_verify() -> Result<()> {
+    fn rsa_pod_with_mainpod_verify() -> Result<()> {
         let rsa_pod = get_test_rsa_pod().unwrap();
         rsa_pod.verify().unwrap();
 

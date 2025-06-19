@@ -16,10 +16,10 @@ pod2 = { git="https://github.com/0xPARC/pod2", rev="c66506c04871dd87c40284de3149
 plonky2_ecdsa = {git = "https://github.com/ax0/plonky2-ecdsa"}
 num = { version = "0.4.0", default-features = false }
 
-# RsaPod specifc dependencies:
+# RsaPod specific dependencies:
 plonky2_ed25519 = {git = "https://github.com/ainta/plonky2-ed25519"}
 plonky2_rsa = { git = "https://github.com/dgulotta/plonky2-rsa.git", branch="fast" }
-ssh-key = { version = "0.6.7", features = ["ed25519"] }
+ssh-key = { version = "0.6.7" }
 sha2 = "0.10"
 
 [features]
