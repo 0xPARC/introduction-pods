@@ -8,16 +8,21 @@ itertools = "0.14.0"
 anyhow = "1.0.56"
 plonky2 = { git = "https://github.com/0xPolygonZero/plonky2" }
 base64 = "0.22.1"
+serde = "1.0.219"
+serde_json = "1.0.140"
+
 # we use a specific commit to avoid breaking changes in the interfaces, updating
 # to latest pod2 version from time to time.
-pod2 = { git="https://github.com/0xPARC/pod2", rev="c66506c04871dd87c40284de31490e33e2179804" }
+pod2 = { git="https://github.com/0xPARC/pod2", rev="0541817116b3d45e88f3f9965877f24791e7f298" }
 
 # EcdsaPod specific dependencies:
 plonky2_ecdsa = {git = "https://github.com/ax0/plonky2-ecdsa"}
 num = { version = "0.4.0", default-features = false }
 
-# RsaPod specific dependencies:
+# Ed25519Pod specific dependencies:
 plonky2_ed25519 = {git = "https://github.com/ainta/plonky2-ed25519"}
+
+# RsaPod specific dependencies:
 plonky2_rsa = { git = "https://github.com/dgulotta/plonky2-rsa.git", branch="fast" }
 ssh-key = { version = "0.6.7" }
 sha2 = "0.10"
