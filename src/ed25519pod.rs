@@ -77,7 +77,7 @@ pub struct Ed25519PodVerifyInput {
 }
 
 impl Ed25519PodVerifyTarget {
-    fn add_targets(builder: &mut CircuitBuilder<F, D>, params: &Params) -> Result<Self> {
+    fn add_targets(builder: &mut CircuitBuilder<F, D>, params: &Params) -> Self {
         let measure = measure_gates_begin!(builder, "Ed25519PodVerifyTarget");
 
         // Verify Ed25519VerifyTarget's proof (with verifier_data hardcoded as constant)
@@ -108,11 +108,11 @@ impl Ed25519PodVerifyTarget {
         builder.register_public_inputs(&vds_root.elements);
 
         measure_gates_end!(builder, measure);
-        Ok(Ed25519PodVerifyTarget {
+        Ed25519PodVerifyTarget {
             vds_root,
             id,
             proof: proof_targ,
-        })
+        }
     }
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &Ed25519PodVerifyInput) -> Result<()> {
@@ -154,7 +154,7 @@ fn build() -> Result<(Ed25519PodVerifyTarget, CircuitData<F, C, D>)> {
     let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
-    let ed25519_pod_verify_target = Ed25519PodVerifyTarget::add_targets(&mut builder, params)?;
+    let ed25519_pod_verify_target = Ed25519PodVerifyTarget::add_targets(&mut builder, params);
     let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
     pod2::backends::plonky2::recursion::pad_circuit(&mut builder, &rec_circuit_data.common);
 
@@ -399,13 +399,12 @@ fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
 pub mod tests {
     use std::any::Any;
 
-    use pod2::{self, frontend::MainPodBuilder};
+    use pod2::{self, frontend::MainPodBuilder, op};
     use ssh_key::SshSig;
 
     use super::*;
 
     #[test]
-    #[ignore]
     fn test_ed25519_pod_with_mainpod_verify() -> Result<()> {
         let params = Params {
             max_input_signed_pods: 0,
@@ -436,7 +435,28 @@ pub mod tests {
 
         // now generate a new MainPod from the ed25519_pod
         let mut main_pod_builder = MainPodBuilder::new(&params);
-        main_pod_builder.add_main_pod(main_ed25519_pod);
+        main_pod_builder.add_main_pod(main_ed25519_pod.clone());
+
+        // add operation that ensures that the msg is as expected in the EcdsaPod
+        let signed_data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig);
+        let msg_fields: Vec<F> = signed_data
+            .iter()
+            .map(|&b| F::from_canonical_u8(b))
+            .collect();
+        let msg_hash = PoseidonHash::hash_no_pad(&msg_fields);
+        let msg_copy = main_pod_builder
+            .pub_op(op!(
+                new_entry,
+                (KEY_SIGNED_MSG, Value::from(RawValue(msg_hash.elements)))
+            ))
+            .unwrap();
+        main_pod_builder
+            .pub_op(op!(eq, (&main_ed25519_pod, KEY_SIGNED_MSG), msg_copy))
+            .unwrap();
+        // perpetuate the pk
+        main_pod_builder
+            .pub_op(op!(copy, main_ed25519_pod.public_statements[2].clone()))
+            .unwrap();
 
         let mut prover = pod2::backends::plonky2::mock::mainpod::MockProver {};
         let pod = main_pod_builder.prove(&mut prover, &params).unwrap();
@@ -452,7 +472,6 @@ pub mod tests {
 
         Ok(())
     }
-
 
     #[test]
     fn test_ed25519_pod_only_verify() -> Result<()> {

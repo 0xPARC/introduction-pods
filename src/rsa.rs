@@ -1,37 +1,26 @@
 /**
  * This code taken/adapted from github.com/dgulotta/double-blind/src/rsa.rs
  */
-
-
 use anyhow::anyhow;
 use num::BigUint;
 use plonky2::{
-    iop::{
-        target::Target, witness::PartialWitness
-    },
+    iop::{target::Target, witness::PartialWitness},
     plonk::circuit_builder::CircuitBuilder,
 };
 use plonky2_rsa::gadgets::{
-    biguint::{
-        CircuitBuilderBigUint, WitnessBigUint
-    },
+    biguint::{CircuitBuilderBigUint, WitnessBigUint},
     rsa::pow_65537,
 };
+use pod2::backends::plonky2::basetypes::{D, F};
 use ssh_key::{
-    SshSig, Mpint,
-    public::{
-        KeyData, RsaPublicKey
-    },
-};
-use pod2::backends::plonky2::basetypes::{
-    D, F
+    Mpint, SshSig,
+    public::{KeyData, RsaPublicKey},
 };
 
 pub(super) const BITS: usize = 27;
 pub type BigUintTarget = plonky2_rsa::gadgets::biguint::BigUintTarget<BITS>;
 
 pub(super) const RSA_LIMBS: usize = 4096usize.div_ceil(BITS);
-
 
 fn mpint_to_biguint(x: &Mpint) -> BigUint {
     BigUint::from_bytes_be(x.as_positive_bytes().unwrap())
@@ -42,7 +31,7 @@ fn mpint_to_biguint(x: &Mpint) -> BigUint {
 pub struct RSATargets {
     pub signature: BigUintTarget,
     pub modulus: BigUintTarget,
-    pub padded_data: BigUintTarget
+    pub padded_data: BigUintTarget,
 }
 
 impl RSATargets {
@@ -60,7 +49,6 @@ fn public_key_modulus(key: &RsaPublicKey) -> BigUint {
     mpint_to_biguint(&key.n)
 }
 
-
 /// Builds the RSA part of the circuit.  Returns the targets containing the public
 /// key and Double Blind key.
 pub fn build_rsa(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
@@ -69,15 +57,18 @@ pub fn build_rsa(builder: &mut CircuitBuilder<F, D>) -> RSATargets {
     let computed_padded_data = pow_65537(builder, &signature, &modulus);
     let padded_data = builder.add_virtual_biguint_target(RSA_LIMBS);
     builder.connect_biguint(&padded_data, &computed_padded_data);
-    RSATargets { signature, modulus, padded_data }
-
+    RSATargets {
+        signature,
+        modulus,
+        padded_data,
+    }
 }
 
 pub fn set_rsa_targets(
     pw: &mut PartialWitness<F>,
     targets: &RSATargets,
     sig: &SshSig,
-    padded_data: &Vec<u8>
+    padded_data: &Vec<u8>,
 ) -> anyhow::Result<()> {
     let signature = BigUint::from_bytes_be(sig.signature_bytes());
     pw.set_biguint_target(&targets.signature, &signature)?;
