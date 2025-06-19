@@ -194,7 +194,7 @@ impl EcdsaPodVerifyTarget {
 }
 
 /// EcdsaPod implements the trait RecursivePod
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcdsaPod {
     params: Params,
     id: PodId,
@@ -551,8 +551,10 @@ pub mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_ecdsa_pod() -> Result<()> {
+    fn compute_new_ecdsa_pod(
+        sk: ECDSASecretKey<Secp256K1>,
+        msg: Secp256K1Scalar,
+    ) -> Result<(Box<dyn RecursivePod>, Params, VDSet)> {
         // first generate all the circuits data so that it does not need to be
         // computed at further stages of the test (affecting the time reports)
         timed!(
@@ -563,14 +565,10 @@ pub mod tests {
                 let _ = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
             }
         );
-
         let params = Params {
             max_input_signed_pods: 0,
             ..Default::default()
         };
-
-        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
-        let msg = Secp256K1Scalar([321, 654, 987, 321]);
 
         // compute the pk & signature
         let pk: ECDSAPublicKey<Secp256K1> =
@@ -594,6 +592,15 @@ pub mod tests {
             "EcdsaPod::new",
             EcdsaPod::new(&params, vdset.root(), msg, pk, signature).unwrap()
         );
+        Ok((ecdsa_pod, params, vdset))
+    }
+
+    #[test]
+    fn test_ecdsa_pod() -> Result<()> {
+        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
+        let msg = Secp256K1Scalar([321, 654, 987, 321]);
+
+        let (ecdsa_pod, params, vdset) = compute_new_ecdsa_pod(sk, msg)?;
 
         ecdsa_pod.verify().unwrap();
         // pod2::measure_gates_print!();
@@ -642,6 +649,28 @@ pub mod tests {
             .downcast::<mainpod::MainPod>()
             .unwrap();
         pod.verify().unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialization() -> Result<()> {
+        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
+        let msg = Secp256K1Scalar([321, 654, 987, 321]);
+
+        let (ecdsa_pod, params, vdset) = compute_new_ecdsa_pod(sk, msg)?;
+
+        ecdsa_pod.verify().unwrap();
+
+        let ecdsa_pod = (ecdsa_pod as Box<dyn Any>).downcast::<EcdsaPod>().unwrap();
+        let data = ecdsa_pod.serialize_data();
+        let recovered_ecdsa_pod =
+            EcdsaPod::deserialize_data(params, data, vdset.root(), ecdsa_pod.id).unwrap();
+        let recovered_ecdsa_pod = (recovered_ecdsa_pod as Box<dyn Any>)
+            .downcast::<EcdsaPod>()
+            .unwrap();
+
+        assert_eq!(recovered_ecdsa_pod, ecdsa_pod);
 
         Ok(())
     }

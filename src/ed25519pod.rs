@@ -136,7 +136,7 @@ impl Ed25519PodVerifyTarget {
 }
 
 /// Ed25519Pod implements the trait RecursivePod
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ed25519Pod {
     params: Params,
     id: PodId,
@@ -319,7 +319,7 @@ impl Ed25519Pod {
         raw_msg: &str,
         sig: &SshSig,
         namespace: &str,
-    ) -> Result<Box<dyn Pod>, Box<DynError>> {
+    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
         Ok(Self::_prove(params, vds_root, raw_msg, sig, namespace).map(Box::new)?)
     }
 
@@ -448,18 +448,15 @@ pub mod tests {
 
     use super::*;
 
-    #[test]
-    #[ignore] // This is for the GitHub CI, it takes too long and the CI would fail.
-    fn test_ed25519_pod_with_mainpod_verify() -> Result<()> {
+    fn compute_new_ecdsa_pod(
+        namespace: &str,
+        msg: &str,
+        sig: &SshSig,
+    ) -> Result<(Box<dyn RecursivePod>, Params, VDSet)> {
         let params = Params {
             max_input_signed_pods: 0,
             ..Default::default()
         };
-
-        // Use the sample data from plonky2_ed25519
-        let msg = "0xPARC\n";
-        let namespace = "double-blind.xyz";
-        let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
 
         let vds = vec![
             pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA
@@ -475,8 +472,21 @@ pub mod tests {
 
         let ed25519_pod = timed!(
             "Ed25519Pod::new",
-            Ed25519Pod::new(&params, vdset.root(), msg, &sig, namespace).unwrap()
+            Ed25519Pod::new(&params, vdset.root(), &msg, &sig, &namespace).unwrap()
         );
+
+        Ok((ed25519_pod, params, vdset))
+    }
+
+    #[test]
+    #[ignore] // This is for the GitHub CI, it takes too long and the CI would fail.
+    fn test_ed25519_pod_with_mainpod_verify() -> Result<()> {
+        // Use the sample data from plonky2_ed25519
+        let msg = "0xPARC\n";
+        let namespace = "double-blind.xyz";
+        let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
+
+        let (ed25519_pod, params, vdset) = compute_new_ecdsa_pod(namespace, msg, &sig)?;
 
         ed25519_pod.verify().unwrap();
 
@@ -531,26 +541,27 @@ pub mod tests {
     }
 
     #[test]
-    fn test_ed25519_pod_only_verify() -> Result<()> {
-        let params = Params {
-            max_input_signed_pods: 0,
-            ..Default::default()
-        };
-
+    fn test_serialization() -> Result<()> {
         // Use the sample data from plonky2_ed25519
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
-        // since the pod in this test will not be checked in a MainPod, we can
-        // set the vds_root to empty
-        let vds_root = pod2::middleware::EMPTY_HASH;
 
-        let ed25519_pod = timed!(
-            "Ed25519Pod::new",
-            Ed25519Pod::new(&params, vds_root, msg, &sig, namespace).unwrap()
-        );
+        let (ed25519_pod, params, vdset) = compute_new_ecdsa_pod(namespace, msg, &sig)?;
 
         ed25519_pod.verify().unwrap();
+
+        let ed25519_pod = (ed25519_pod as Box<dyn Any>)
+            .downcast::<Ed25519Pod>()
+            .unwrap();
+        let data = ed25519_pod.serialize_data();
+        let recovered_ecdsa_pod =
+            Ed25519Pod::deserialize_data(params, data, vdset.root(), ed25519_pod.id).unwrap();
+        let recovered_ed25519_pod = (recovered_ecdsa_pod as Box<dyn Any>)
+            .downcast::<Ed25519Pod>()
+            .unwrap();
+
+        assert_eq!(recovered_ed25519_pod, ed25519_pod);
 
         Ok(())
     }
