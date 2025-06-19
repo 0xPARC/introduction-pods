@@ -1,1 +1,3 @@
 [default.extend-words]
+[files]
+extend-exclude = ["test_keys/*"]
