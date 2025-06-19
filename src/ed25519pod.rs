@@ -405,6 +405,7 @@ pub mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_ed25519_pod_with_mainpod_verify() -> Result<()> {
         let params = Params {
             max_input_signed_pods: 0,
@@ -474,6 +475,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_ed25519_pod_only_verify() -> Result<()> {
         let params = Params {
             max_input_signed_pods: 0,

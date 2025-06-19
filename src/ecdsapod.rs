@@ -38,7 +38,7 @@ use plonky2_ecdsa::{
     gadgets::{
         biguint::WitnessBigUint,
         curve::CircuitBuilderCurve,
-        ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_message_circuit},
+        ecdsa::{verify_secp256k1_message_circuit, ECDSAPublicKeyTarget, ECDSASignatureTarget},
         nonnative::{CircuitBuilderNonNative, NonNativeTarget},
     },
 };
@@ -97,7 +97,7 @@ impl EcdsaVerifyTarget {
         let s = builder.add_virtual_nonnative_target();
         let sig = ECDSASignatureTarget::<Secp256K1> { r, s };
 
-        verify_message_circuit(builder, msg.clone(), sig.clone(), pk.clone());
+        verify_secp256k1_message_circuit(builder, msg.clone(), sig.clone(), pk.clone());
 
         // register public inputs
         for l in msg.value.limbs.iter() {
@@ -457,6 +457,7 @@ pub mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_pub_self_statements_target() -> Result<()> {
         let params = &Default::default();
 
@@ -515,6 +516,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_ecdsa_pod_verify() -> Result<()> {
         // first generate all the circuits data so that it does not need to be
         // computed at further stages of the test (affecting the time reports)

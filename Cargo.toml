@@ -13,10 +13,21 @@ base64 = "0.22.1"
 pod2 = { git="https://github.com/0xPARC/pod2", rev="c66506c04871dd87c40284de31490e33e2179804" }
 
 # EcdsaPod specific dependencies:
-plonky2_ecdsa = {git = "https://github.com/ax0/plonky2-ecdsa"}
+plonky2_ecdsa = {git = "https://github.com/ainta/plonky2-ecdsa"}
 num = { version = "0.4.0", default-features = false }
 plonky2_ed25519 = {git = "https://github.com/ainta/plonky2-ed25519"}
 ssh-key = { version = "0.6.7", features = ["ed25519"] }
+plonky2_sha256 = { git = "https://github.com/ainta/plonky2-sha256", rev="371707d03ed1852b92e7f0d1f349ff81314f4f11" }
+plonky2_u32 = { git = "https://github.com/ax0/plonky2-u32" }
+
+serde         = { version = "1", features = ["derive"] }
+serde_cbor    = "0.11"
+p256          = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
+generic-array = "0.13"                  # for 32-byte arrays
+x509-parser   = "0.16"
+pem           = "3"                     # tiny PEM helper
+sha2          = "0.10"
+typenum       = "1"
 
 [features]
 default = []
