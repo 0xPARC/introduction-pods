@@ -141,7 +141,7 @@ impl RsaPodVerifyTarget {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RsaPod {
     params: Params,
     id: PodId,
@@ -629,6 +629,27 @@ pub mod tests {
             130, 136, 20, 149, 230, 135, 249, 125, 234, 20, 202, 101, 48, 221, 110, 27, 245, 17,
             102, 82, 107, 69, 88, 89, 51
         ]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn serialization() -> Result<()> {
+        let (rsa_pod, vd_set) = get_test_rsa_pod().unwrap();
+
+        rsa_pod.verify().unwrap();
+
+        let rsa_pod = (rsa_pod as Box<dyn Any>)
+            .downcast::<RsaPod>()
+            .unwrap();
+        let data = rsa_pod.serialize_data();
+        let recovered_rsa_pod =
+            RsaPod::deserialize_data(rsa_pod.params().clone(), data, vd_set.root(), rsa_pod.id()).unwrap();
+        let recovered_rsa_pod = (recovered_rsa_pod as Box<dyn Any>)
+            .downcast::<RsaPod>()
+            .unwrap();
+
+        assert_eq!(recovered_rsa_pod, rsa_pod);
 
         Ok(())
     }
