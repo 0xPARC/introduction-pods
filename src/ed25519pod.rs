@@ -472,7 +472,7 @@ pub mod tests {
 
         let ed25519_pod = timed!(
             "Ed25519Pod::new",
-            Ed25519Pod::new(&params, vdset.root(), &msg, &sig, &namespace).unwrap()
+            Ed25519Pod::new(&params, vdset.root(), msg, sig, namespace).unwrap()
         );
 
         Ok((ed25519_pod, params, vdset))

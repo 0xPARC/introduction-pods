@@ -1,7 +1,8 @@
-use std::sync::LazyLock;
+use std::{cmp::Ordering, sync::LazyLock};
+
 use anyhow::anyhow;
-use num::BigUint;
 use itertools::Itertools;
+use num::BigUint;
 use plonky2::{
     field::types::Field,
     hash::{
@@ -25,7 +26,7 @@ use plonky2_rsa::gadgets::{
 };
 use pod2::{
     backends::plonky2::{
-        Error, Result, serialize_proof, deserialize_proof,
+        Error, Result,
         basetypes::{C, D, F},
         circuits::{
             common::{
@@ -33,21 +34,23 @@ use pod2::{
             },
             mainpod::CalculateIdGadget,
         },
+        deserialize_proof,
         mainpod::{self, calculate_id, get_common_data},
+        serialize_proof,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, Hash, KEY_TYPE, Key, NativePredicate, Params,
-        Pod, PodId, Proof, RawValue, SELF, Statement, ToFields, Value, RecursivePod,
+        self, AnchoredKey, DynError, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId,
+        Proof, RawValue, RecursivePod, SELF, Statement, ToFields, Value,
     },
     timed,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use ssh_key::{
-    Algorithm, HashAlg, SshSig, Mpint,
-    public::{KeyData, RsaPublicKey}
+    Algorithm, HashAlg, Mpint, SshSig,
+    public::{KeyData, RsaPublicKey},
 };
-use serde::{Serialize, Deserialize};
 
 use crate::{
     PodType,
@@ -110,7 +113,7 @@ pub fn set_rsa_targets(
     pw: &mut PartialWitness<F>,
     targets: &RSATargets,
     sig: &SshSig,
-    padded_data: &Vec<u8>,
+    padded_data: &[u8],
 ) -> anyhow::Result<()> {
     let signature = BigUint::from_bytes_be(sig.signature_bytes());
     pw.set_biguint_target(&targets.signature, &signature)?;
@@ -128,9 +131,6 @@ pub fn set_rsa_targets(
         Err(anyhow!("Not an RSA signature"))
     }
 }
-
-
-
 
 static RSA_VERIFY_DATA: LazyLock<(RSATargets, CircuitData<F, C, D>)> =
     LazyLock::new(|| build_rsa_verify().expect("successful build"));
@@ -214,14 +214,12 @@ impl RsaPodVerifyTarget {
     }
 }
 
-
 #[derive(Serialize, Deserialize)]
 struct Data {
     msg: Vec<u8>,
     pk: Vec<u8>,
     proof: String,
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RsaPod {
@@ -468,7 +466,7 @@ fn pub_self_statements_target(
     vec![st_type, st_msg, st_pk]
 }
 
-fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement> {
+fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
     let st_type = type_statement();
 
     // Hash the message
@@ -495,7 +493,7 @@ fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement
 // Helper function to convert bit targets to byte targets
 fn le_bits_to_bytes_targets(
     builder: &mut CircuitBuilder<F, D>,
-    bits: &Vec<BoolTarget>,
+    bits: &[BoolTarget],
 ) -> Vec<Target> {
     assert_eq!(bits.len() % 8, 0);
     let mut bytes = Vec::new();
@@ -522,14 +520,18 @@ fn biguint_to_bits_targets(
         bits.extend_from_slice(&builder.split_le(*limb, BITS));
     }
 
-    if bits.len() < total_bits {
-        bits.extend(vec![false_target; total_bits - bits.len()]);
-    } else if bits.len() > total_bits {
-        for i in total_bits..bits.len() {
-            let not_bit_i = builder.not(bits[i]);
-            builder.assert_bool(not_bit_i);
+    match bits.len().cmp(&total_bits) {
+        Ordering::Less => {
+            bits.extend(vec![false_target; total_bits - bits.len()]);
         }
-        return bits[..total_bits].to_vec();
+        Ordering::Equal => {}
+        Ordering::Greater => {
+            for bit in bits.iter().skip(total_bits) {
+                let not_bit_i = builder.not(*bit);
+                builder.assert_bool(not_bit_i);
+            }
+            bits = bits[..total_bits].to_vec();
+        }
     }
     bits
 }
@@ -721,12 +723,11 @@ pub mod tests {
 
         rsa_pod.verify().unwrap();
 
-        let rsa_pod = (rsa_pod as Box<dyn Any>)
-            .downcast::<RsaPod>()
-            .unwrap();
+        let rsa_pod = (rsa_pod as Box<dyn Any>).downcast::<RsaPod>().unwrap();
         let data = rsa_pod.serialize_data();
         let recovered_rsa_pod =
-            RsaPod::deserialize_data(rsa_pod.params().clone(), data, vd_set.root(), rsa_pod.id()).unwrap();
+            RsaPod::deserialize_data(rsa_pod.params().clone(), data, vd_set.root(), rsa_pod.id())
+                .unwrap();
         let recovered_rsa_pod = (recovered_rsa_pod as Box<dyn Any>)
             .downcast::<RsaPod>()
             .unwrap();
