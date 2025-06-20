@@ -1,6 +1,11 @@
 //! Gadgets for proving that a particular substring occurs in a string.
 //!
 //! The implementation is based on the paper https://arxiv.org/abs/2505.13964v1.
+//!
+//! The search uses a hash function that is not collision resistant.  In the
+//! MDL pod, we rely on the fact that the message can't easily be modified
+//! because it is signed, and the substrings can't easily be modified because
+//! they are hashes.
 
 use plonky2::{
     field::{goldilocks_field::GoldilocksField, types::Field},
