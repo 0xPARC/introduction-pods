@@ -1,6 +1,5 @@
 use std::sync::LazyLock;
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
 use plonky2::{
     field::types::Field,
@@ -21,7 +20,7 @@ use plonky2::{
 };
 use pod2::{
     backends::plonky2::{
-        Error, Result,
+        Error, Result, serialize_proof, deserialize_proof,
         basetypes::{C, D},
         circuits::{
             common::{
@@ -29,17 +28,18 @@ use pod2::{
             },
             mainpod::CalculateIdGadget,
         },
-        mainpod::{self, calculate_id},
+        mainpod::{self, calculate_id, get_common_data},
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, EMPTY_HASH, F, Hash, KEY_TYPE, Key, NativePredicate, Params,
-        Pod, PodId, Proof, RawValue, SELF, Statement, ToFields, Value,
+        self, AnchoredKey, DynError, F, Hash, KEY_TYPE, Key, NativePredicate, Params,
+        Pod, PodId, Proof, RawValue, SELF, Statement, ToFields, Value, RecursivePod,
     },
     timed,
 };
 use sha2::{Digest, Sha256, Sha512};
 use ssh_key::{Algorithm, HashAlg, SshSig, public::KeyData};
+use serde::{Serialize, Deserialize};
 
 use crate::{
     PodType,
@@ -50,6 +50,14 @@ const RSA_BYTE_SIZE: usize = 512;
 
 const KEY_SIGNED_MSG: &str = "signed_msg";
 const KEY_RSA_PK: &str = "rsa_pk";
+
+#[derive(Serialize, Deserialize)]
+struct Data {
+    msg: Vec<u8>,
+    pk: Vec<u8>,
+    proof: String,
+}
+
 
 static RSA_VERIFY_DATA: LazyLock<(RSATargets, CircuitData<F, C, D>)> =
     LazyLock::new(|| build_rsa_verify().expect("successful build"));
@@ -140,10 +148,10 @@ pub struct RsaPod {
     msg: Vec<u8>,
     pk: Vec<u8>,
     proof: Proof,
-    vds_hash: Hash,
+    vds_root: Hash,
 }
 
-impl middleware::RecursivePod for RsaPod {
+impl RecursivePod for RsaPod {
     fn verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
         let (_, circuit_data) = &*STANDARD_RSA_POD_DATA;
         circuit_data.verifier_data().verifier_only
@@ -152,7 +160,25 @@ impl middleware::RecursivePod for RsaPod {
         self.proof.clone()
     }
     fn vds_root(&self) -> Hash {
-        self.vds_hash
+        self.vds_root
+    }
+    fn deserialize_data(
+        params: Params,
+        data: serde_json::Value,
+        vds_root: Hash,
+        id: PodId,
+    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
+        let data: Data = serde_json::from_value(data)?;
+        let common = get_common_data(&params)?;
+        let proof = deserialize_proof(&common, &data.proof)?;
+        Ok(Box::new(Self {
+            params,
+            id,
+            msg: data.msg,
+            pk: data.pk,
+            proof,
+            vds_root,
+        }))
     }
 }
 
@@ -247,7 +273,7 @@ impl RsaPod {
             msg: encoded_padded_data,
             pk: pk_bytes,
             proof: proof_with_pis.proof,
-            vds_hash: EMPTY_HASH,
+            vds_root,
         })
     }
 
@@ -277,7 +303,7 @@ impl RsaPod {
         let public_inputs = id
             .to_fields(&self.params)
             .iter()
-            .chain(EMPTY_HASH.0.iter()) // slot for the unused vds root
+            .chain(self.vds_root().0.iter()) // slot for the unused vds root
             .cloned()
             .collect_vec();
 
@@ -307,16 +333,22 @@ impl Pod for RsaPod {
         pub_self_statements(&self.msg, &self.pk)
     }
 
-    fn serialized_proof(&self) -> String {
-        let mut buffer = Vec::new();
-        use plonky2::util::serialization::Write;
-        buffer.write_proof(&self.proof).unwrap();
-        BASE64_STANDARD.encode(buffer)
+    fn pod_type(&self) -> (usize, &'static str) {
+        (PodType::Rsa as usize, "RSA")
+    }
+
+    fn serialize_data(&self) -> serde_json::Value {
+        serde_json::to_value(Data {
+            proof: serialize_proof(&self.proof),
+            msg: self.msg.clone(),
+            pk: self.pk.clone(),
+        })
+        .expect("serialization to json")
     }
 }
 
 fn type_statement() -> Statement {
-    Statement::ValueOf(
+    Statement::equal(
         AnchoredKey::from((SELF, KEY_TYPE)),
         Value::from(PodType::Rsa),
     )
@@ -341,7 +373,7 @@ fn pub_self_statements_target(
     let ak_msg = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&msg_hash.elements));
     let st_msg =
-        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_msg, value]);
+        StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak_msg, value]);
 
     // Hash the public key
     let pk_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(pk.to_vec());
@@ -349,7 +381,7 @@ fn pub_self_statements_target(
     let ak_pk = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&pk_hash.elements));
     let st_pk =
-        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_pk, value]);
+        StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak_pk, value]);
 
     vec![st_type, st_msg, st_pk]
 }
@@ -361,7 +393,7 @@ fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement
     let msg_fields: Vec<F> = msg.iter().map(|&b| F::from_canonical_u8(b)).collect();
     let msg_hash = PoseidonHash::hash_no_pad(&msg_fields);
 
-    let st_msg = Statement::ValueOf(
+    let st_msg = Statement::equal(
         AnchoredKey::from((SELF, KEY_SIGNED_MSG)),
         Value::from(RawValue(msg_hash.elements)),
     );
@@ -370,7 +402,7 @@ fn pub_self_statements(msg: &Vec<u8>, pk: &Vec<u8>) -> Vec<middleware::Statement
     let pk_fields: Vec<F> = pk.iter().map(|&b| F::from_canonical_u8(b)).collect();
     let pk_hash = PoseidonHash::hash_no_pad(&pk_fields);
 
-    let st_pk = Statement::ValueOf(
+    let st_pk = Statement::equal(
         AnchoredKey::from((SELF, KEY_RSA_PK)),
         Value::from(RawValue(pk_hash.elements)),
     );
@@ -478,33 +510,45 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
 pub mod tests {
     use std::any::Any;
 
-    use pod2::{self, frontend::MainPodBuilder};
+    use pod2::{self, frontend::MainPodBuilder, middleware::VDSet};
 
     use super::*;
 
-    fn get_test_rsa_pod() -> Result<Box<dyn Pod>, Box<DynError>> {
+    fn get_test_rsa_pod() -> Result<(Box<dyn Pod>, VDSet)> {
         let params = Params {
             max_input_signed_pods: 0,
             ..Default::default()
         };
 
-        // Use the sample data from plonky2_ed25519
+        let vds = vec![
+            pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA
+                .verifier_only
+                .clone(),
+            pod2::backends::plonky2::emptypod::STANDARD_EMPTY_POD_DATA
+                .1
+                .verifier_only
+                .clone(),
+            STANDARD_RSA_POD_DATA.1.verifier_only.clone(),
+        ];
+        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
+
+        // Use the sample data from plonky2_rsa
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/id_rsa_example.sig")).unwrap();
-        let vds_root = EMPTY_HASH;
+        let vds_root = vdset.root();
 
         let rsa_pod = timed!(
             "RsaPod::new",
             RsaPod::new(&params, vds_root, msg, &sig, namespace).unwrap()
         );
-        Ok(rsa_pod)
+        Ok((rsa_pod, vdset))
     }
 
     #[test]
     #[ignore] // This test is a subset of rsa_pod_with_mainpod_verify
     fn rsa_pod_only_verify() -> Result<()> {
-        let rsa_pod = get_test_rsa_pod().unwrap();
+        let (rsa_pod, _) = get_test_rsa_pod().unwrap();
         rsa_pod.verify().unwrap();
 
         Ok(())
@@ -512,7 +556,7 @@ pub mod tests {
 
     #[test]
     fn rsa_pod_with_mainpod_verify() -> Result<()> {
-        let rsa_pod = get_test_rsa_pod().unwrap();
+        let (rsa_pod, vd_set) = get_test_rsa_pod().unwrap();
         rsa_pod.verify().unwrap();
 
         let params = rsa_pod.params().clone();
@@ -527,7 +571,7 @@ pub mod tests {
         };
 
         // now generate a new MainPod from the rsa_pod
-        let mut main_pod_builder = MainPodBuilder::new(&params);
+        let mut main_pod_builder = MainPodBuilder::new(&params, &vd_set);
         main_pod_builder.add_main_pod(main_rsa_pod);
 
         let mut prover = pod2::backends::plonky2::mock::mainpod::MockProver {};
