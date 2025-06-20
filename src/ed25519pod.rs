@@ -88,7 +88,7 @@ pub struct Ed25519PodVerifyInput {
 }
 
 impl Ed25519PodVerifyTarget {
-    fn add_targets(builder: &mut CircuitBuilder<F, D>, params: &Params) -> Result<Self> {
+    fn add_targets(builder: &mut CircuitBuilder<F, D>, params: &Params) -> Self {
         let measure = measure_gates_begin!(builder, "Ed25519PodVerifyTarget");
 
         // Verify Ed25519VerifyTarget's proof (with verifier_data hardcoded as constant)
@@ -119,11 +119,11 @@ impl Ed25519PodVerifyTarget {
         builder.register_public_inputs(&vds_root.elements);
 
         measure_gates_end!(builder, measure);
-        Ok(Ed25519PodVerifyTarget {
+        Ed25519PodVerifyTarget {
             vds_root,
             id,
             proof: proof_targ,
-        })
+        }
     }
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &Ed25519PodVerifyInput) -> Result<()> {
@@ -222,7 +222,7 @@ fn build() -> Result<(Ed25519PodVerifyTarget, CircuitData<F, C, D>)> {
     let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
     let config = CircuitConfig::standard_recursion_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
-    let ed25519_pod_verify_target = Ed25519PodVerifyTarget::add_targets(&mut builder, params)?;
+    let ed25519_pod_verify_target = Ed25519PodVerifyTarget::add_targets(&mut builder, params);
     let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
     pod2::backends::plonky2::recursion::pad_circuit(&mut builder, &rec_circuit_data.common);
 
@@ -472,7 +472,7 @@ pub mod tests {
 
         let ed25519_pod = timed!(
             "Ed25519Pod::new",
-            Ed25519Pod::new(&params, vdset.root(), &msg, &sig, &namespace).unwrap()
+            Ed25519Pod::new(&params, vdset.root(), msg, sig, namespace).unwrap()
         );
 
         Ok((ed25519_pod, params, vdset))
