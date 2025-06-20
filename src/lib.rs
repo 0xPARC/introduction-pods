@@ -5,7 +5,6 @@ use pod2::middleware::TypedValue;
 
 pub mod ecdsapod;
 pub mod ed25519pod;
-pub mod rsa;
 pub mod rsapod;
 
 pub enum PodType {
