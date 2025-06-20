@@ -67,7 +67,7 @@ static P256_VERIFY_DATA: LazyLock<(P256VerifyTarget, CircuitData<F, C, D>)> =
     LazyLock::new(|| build_p256_verify().expect("successful build"));
 
 fn build_p256_verify() -> Result<(P256VerifyTarget, CircuitData<F, C, D>)> {
-    let config = CircuitConfig::standard_ecc_config();
+    let config = CircuitConfig::wide_ecc_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let p256_verify_target = P256VerifyTarget::add_targets(&mut builder)?;
 
@@ -170,9 +170,7 @@ impl P256VerifyTarget {
     ) -> Result<()> {
         let msg_bits = array_to_bits(&msg);
         for (i, &bit) in msg_bits.iter().enumerate() {
-            if i < self.sha256_targets.message.len() {
-                pw.set_bool_target(self.sha256_targets.message[i], bit);
-            }
+            pw.set_bool_target(self.sha256_targets.message[i], bit)?;
         }
         pw.set_biguint_target(&self.pk.0.x.value, &biguint_from_array(pk.0.x.0))?;
         pw.set_biguint_target(&self.pk.0.y.value, &biguint_from_array(pk.0.y.0))?;
@@ -669,14 +667,14 @@ pub mod tests {
         let msg_bits = array_to_bits(&msg);
         for (i, &bit) in msg_bits.iter().enumerate() {
             if i < sha256_targets.message.len() {
-                pw.set_bool_target(sha256_targets.message[i], bit);
+                pw.set_bool_target(sha256_targets.message[i], bit)?;
             }
         }
         
         // Convert expected digest bytes to bits and set as witness
         let expected_digest_bits = array_to_bits(&digest);
         for (i, &bit) in expected_digest_bits.iter().enumerate() {
-            pw.set_bool_target(expected_digest_targets[i], bit);
+            pw.set_bool_target(expected_digest_targets[i], bit)?;
         }
         
         // Generate proof
@@ -684,10 +682,6 @@ pub mod tests {
         
         // Verify proof
         data.verify(proof)?;
-        
-        println!("SHA256 circuit test passed!");
-        println!("Message length: {} bytes", msg.len());
-        println!("Expected digest matches computed digest!");
         
         Ok(())
     }

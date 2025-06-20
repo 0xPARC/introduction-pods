@@ -17,7 +17,7 @@ plonky2_ecdsa = {git = "https://github.com/ainta/plonky2-ecdsa"}
 num = { version = "0.4.0", default-features = false }
 plonky2_ed25519 = {git = "https://github.com/ainta/plonky2-ed25519"}
 ssh-key = { version = "0.6.7", features = ["ed25519"] }
-plonky2_sha256 = { git = "https://github.com/ainta/plonky2-sha256", rev="371707d03ed1852b92e7f0d1f349ff81314f4f11" }
+plonky2_sha256 = { git = "https://github.com/ainta/plonky2-sha256" }
 plonky2_u32 = { git = "https://github.com/ax0/plonky2-u32" }
 
 serde         = { version = "1", features = ["derive"] }
