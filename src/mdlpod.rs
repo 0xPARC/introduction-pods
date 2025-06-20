@@ -1,4 +1,12 @@
-// mdlpod.rs
+//! Implements the MdlPod, a POD that proves that the given `pk` has signed
+//! the `msg` with the ES256 signature scheme.
+//!
+//! This POD is build through two steps:
+//! - first it generates a plonky2 proof of correct signature verification
+//! - then, verifies the previous proof in a new plonky2 proof, using the
+//!   `standard_recursion_config`, padded to match the `RecursiveCircuit<MainPod>`
+//!   configuration.
+
 use std::sync::LazyLock;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -45,16 +53,18 @@ use pod2::{
             },
             mainpod::CalculateIdGadget,
         },
-        mainpod,
-        mainpod::calculate_id,
+        deserialize_proof, mainpod,
+        mainpod::{calculate_id, get_common_data},
+        serialize_proof,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, EMPTY_HASH, F, Hash, KEY_TYPE, Key, NativePredicate, Params,
+        self, AnchoredKey, DynError, F, Hash, KEY_TYPE, Key, NativePredicate, Params, 
         Pod, PodId, RawValue, RecursivePod, SELF, Statement, ToFields, Value,
     },
     timed,
 };
+use serde::{Deserialize, Serialize};
 use crate::PodType;
 use plonky2_ecdsa::field::p256_scalar::P256Scalar;
 use sha2::{Digest, Sha256};
@@ -74,6 +84,14 @@ fn build_p256_verify() -> Result<(P256VerifyTarget, CircuitData<F, C, D>)> {
     let data = timed!("P256Verify build", builder.build::<C>());
     Ok((p256_verify_target, data))
 }
+
+#[derive(Serialize, Deserialize)]
+struct Data {
+    msg: Vec<u8>,
+    pk: ECDSAPublicKey<P256>,
+    proof: String,
+}
+
 
 /// Note: this circuit requires the CircuitConfig's standard_ecc_config or
 /// wide_ecc_config.
@@ -242,10 +260,10 @@ pub struct MdlPod {
     msg: Vec<u8>,
     pk: ECDSAPublicKey<P256>,
     proof: Proof,
-    vds_hash: Hash,
+    vds_root: Hash,
 }
 
-impl middleware::RecursivePod for MdlPod {
+impl RecursivePod for MdlPod {
     fn verifier_data(&self) -> VerifierOnlyCircuitData<C, D> {
         let (_, circuit_data) = &*STANDARD_MDL_POD_DATA;
         circuit_data.verifier_data().verifier_only
@@ -254,7 +272,25 @@ impl middleware::RecursivePod for MdlPod {
         self.proof.clone()
     }
     fn vds_root(&self) -> Hash {
-        self.vds_hash
+        self.vds_root
+    }
+    fn deserialize_data(
+        params: Params,
+        data: serde_json::Value,
+        vds_root: Hash,
+        id: PodId,
+    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
+        let data: Data = serde_json::from_value(data)?;
+        let common = get_common_data(&params)?;
+        let proof = deserialize_proof(&common, &data.proof)?;
+        Ok(Box::new(Self {
+            params,
+            id,
+            msg: data.msg,
+            pk: data.pk,
+            proof,
+            vds_root,
+        }))
     }
 }
 
@@ -407,7 +443,7 @@ impl MdlPod {
             msg,
             pk,
             proof: proof_with_pis.proof,
-            vds_hash: EMPTY_HASH,
+            vds_root,
         })
     }
 
@@ -484,16 +520,23 @@ impl Pod for MdlPod {
         pub_self_statements(msg_scalar, self.pk)
     }
 
-    fn serialized_proof(&self) -> String {
-        let mut buffer = Vec::new();
-        use plonky2::util::serialization::Write;
-        buffer.write_proof(&self.proof).unwrap();
-        BASE64_STANDARD.encode(buffer)
+    fn pod_type(&self) -> (usize, &'static str) {
+        (PodType::Mdl as usize, "Mdl")
+    }
+
+
+    fn serialize_data(&self) -> serde_json::Value {
+        serde_json::to_value(Data {
+            proof: serialize_proof(&self.proof),
+            msg: self.msg.clone(),
+            pk: self.pk.clone(),
+        })
+        .expect("serialization to json")
     }
 }
 
 fn type_statement() -> Statement {
-    Statement::ValueOf(
+    Statement::equal(
         AnchoredKey::from((SELF, KEY_TYPE)),
         Value::from(PodType::Mdl),
     )
@@ -517,14 +560,14 @@ fn pub_self_statements_target(
     let ak_msg = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&msg_hash.elements));
     let st_msg =
-        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_msg, value]);
+        StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak_msg, value]);
 
     let pk_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(pk.to_vec());
     let ak_key = builder.constant_value(Key::from(KEY_P256_PK).raw());
     let ak_pk = StatementArgTarget::anchored_key(builder, &ak_podid, &ak_key);
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&pk_hash.elements));
     let st_pk =
-        StatementTarget::new_native(builder, params, NativePredicate::ValueOf, &[ak_pk, value]);
+        StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak_pk, value]);
 
     vec![st_type, st_msg, st_pk]
 }
@@ -540,7 +583,7 @@ fn pub_self_statements(
     let msg_limbs = p256_field_to_limbs(msg.0);
     let msg_hash = PoseidonHash::hash_no_pad(&msg_limbs);
 
-    let st_msg = Statement::ValueOf(
+    let st_msg = Statement::equal(
         AnchoredKey::from((SELF, KEY_SIGNED_MSG)),
         Value::from(RawValue(msg_hash.elements)),
     );
@@ -550,7 +593,7 @@ fn pub_self_statements(
     let pk_y_limbs = p256_field_to_limbs(pk.0.y.0);
     let pk_hash = PoseidonHash::hash_no_pad(&[pk_x_limbs, pk_y_limbs].concat());
 
-    let st_pk = Statement::ValueOf(
+    let st_pk = Statement::equal(
         AnchoredKey::from((SELF, KEY_P256_PK)),
         Value::from(RawValue(pk_hash.elements)),
     );
@@ -596,6 +639,7 @@ pub mod tests {
     use p256::PublicKey;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use plonky2_sha256::circuit::array_to_bits;
+    use pod2::middleware::VDSet;
     use pod2::{self, frontend::MainPodBuilder, op};
     use anyhow::Context;
 
@@ -714,7 +758,19 @@ pub mod tests {
             max_input_signed_pods: 0,
             ..Default::default()
         };
-        let vds_root = EMPTY_HASH;
+
+        let vds = vec![
+            pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA
+                .verifier_only
+                .clone(),
+            pod2::backends::plonky2::emptypod::STANDARD_EMPTY_POD_DATA
+                .1
+                .verifier_only
+                .clone(),
+            STANDARD_MDL_POD_DATA.1.verifier_only.clone(),
+        ];
+        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
+        let vds_root = vdset.root();
         
         let mdl_pod = timed!(
             "MdlPod::new",
@@ -755,7 +811,21 @@ pub mod tests {
             max_input_signed_pods: 0,
             ..Default::default()
         };
-        let vds_root = EMPTY_HASH;
+
+
+        let vds = vec![
+            pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA
+                .verifier_only
+                .clone(),
+            pod2::backends::plonky2::emptypod::STANDARD_EMPTY_POD_DATA
+                .1
+                .verifier_only
+                .clone(),
+            STANDARD_MDL_POD_DATA.1.verifier_only.clone(),
+        ];
+        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
+        let vds_root = vdset.root();
+        
         
         let mdl_pod = timed!(
             "MdlPod::new",
@@ -772,7 +842,7 @@ pub mod tests {
         };
 
         // Generate a new MainPod
-        let mut main_pod_builder = MainPodBuilder::new(&params);
+        let mut main_pod_builder = MainPodBuilder::new(&params, &vdset);
         main_pod_builder.add_main_pod(main_mdl_pod.clone());
 
         let digest = Sha256::digest(&msg);
@@ -785,8 +855,10 @@ pub mod tests {
         let msg_copy = main_pod_builder
             .pub_op(op!(
                 new_entry,
-                (KEY_SIGNED_MSG, Value::from(RawValue(msg_hash.elements)))
-            ))?;
+                KEY_SIGNED_MSG,
+                Value::from(RawValue(msg_hash.elements))
+            ))
+            .unwrap();
         main_pod_builder
             .pub_op(op!(eq, (&main_mdl_pod, KEY_SIGNED_MSG), msg_copy))?;
 
