@@ -173,10 +173,16 @@ pub struct StringDataTarget {
     hash: HashOutTarget,
 }
 
+pub struct IntDataTarget {
+    data: Target,
+}
+
 impl DataTarget for StringDataTarget {
     fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self {
+        // TODO: the tag works differently if len > 23
         let str_tag = builder.constant(-F::from_canonical_u8(0x60));
         let name_len = builder.add(cbor[0], str_tag);
+        builder.range_check(name_len, 5);
         Self {
             hash: pod_str_hash(builder, &cbor[1..], name_len),
         }
@@ -197,6 +203,33 @@ impl DataTarget for StringDataTarget {
             elements: hash_str(item_str).0,
         };
         pw.set_hash_target(self.hash, name_hash)
+    }
+}
+
+impl DataTarget for IntDataTarget {
+    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self {
+        // TODO: cbor[0] should be <= 27
+        // TODO: handle values > 2^16
+        builder.range_check(cbor[0], 5);
+        let c_24 = builder.constant(F::from_canonical_u32(24));
+        let c_25 = builder.constant(F::from_canonical_u32(25));
+        let c_256 = builder.constant(F::from_canonical_u32(0x100));
+        let is_24 = builder.is_equal(cbor[0], c_24);
+        let is_25 = builder.is_equal(cbor[0], c_25);
+        let value_2_bytes = builder.mul_add(c_256, cbor[1], cbor[2]);
+        let mut value = builder.select(is_24, cbor[1], cbor[0]);
+        value = builder.select(is_25, value_2_bytes, value);
+        Self { data: value }
+    }
+
+    fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()> {
+        let value = match cbor[0] {
+            0..=23 => cbor[0] as u32,
+            24 => cbor[1] as u32,
+            25 => ((cbor[1] as u32) << 8) | (cbor[2] as u32),
+            _ => anyhow::bail!("Expected: integer between 0 and 65535"),
+        };
+        pw.set_target(self.data, F::from_canonical_u32(value))
     }
 }
 
@@ -267,7 +300,7 @@ mod test {
     };
 
     use super::parse_data;
-    use crate::mdlpod::parse::{EntryTarget, StringDataTarget};
+    use crate::mdlpod::parse::{EntryTarget, IntDataTarget, StringDataTarget};
 
     const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl_response.cbor");
 
@@ -289,6 +322,22 @@ mod test {
         let data = builder.build::<PoseidonGoldilocksConfig>();
         let mut pw = PartialWitness::new();
         entry_t.set_targets(&mut pw, &family_name_entry.cbor)?;
+        let proof = data.prove(pw)?;
+        data.verify(proof)
+    }
+
+    #[test]
+    fn test_int() -> anyhow::Result<()> {
+        let data = parse_data(CBOR_DATA)?;
+        let height_entry = data
+            .data
+            .get("height")
+            .ok_or_else(|| anyhow!("Could not find height"))?;
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let entry_t = EntryTarget::<IntDataTarget>::new(&mut builder, "height");
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let mut pw = PartialWitness::new();
+        entry_t.set_targets(&mut pw, &height_entry.cbor)?;
         let proof = data.prove(pw)?;
         data.verify(proof)
     }
