@@ -11,6 +11,7 @@ pub mod mdlpod;
 pub enum PodType {
     Ecdsa = 1001,
     Ed25519 = 1002,
+    Mdl = 1003,
 }
 
 impl fmt::Display for PodType {
@@ -18,6 +19,7 @@ impl fmt::Display for PodType {
         match self {
             PodType::Ed25519 => write!(f, "Ed25519"),
             PodType::Ecdsa => write!(f, "Ecdsa"),
+            PodType::Mdl => write!(f, "Mdl"),
         }
     }
 }
