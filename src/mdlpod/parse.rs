@@ -109,11 +109,11 @@ pub fn prefix_for_key(key: &str) -> Vec<u8> {
 
 #[derive(Debug, Clone)]
 pub struct MdlField {
-    key: String,
-    value: TypedValue,
-    digest_id: u64,
-    random: Vec<u8>,
-    cbor: Vec<u8>,
+    pub key: String,
+    pub value: TypedValue,
+    pub digest_id: u64,
+    pub random: Vec<u8>,
+    pub cbor: Vec<u8>,
 }
 
 pub struct MdlData {
@@ -173,125 +173,124 @@ pub fn sha_256_pad(v: &mut Vec<u8>, max_blocks: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub trait DataTarget {
-    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self;
-    fn value_target(&self) -> ValueTarget;
-    fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()>;
+fn string_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTarget {
+    // TODO: the tag works differently if len > 23
+    let str_tag = builder.constant(-F::from_canonical_u8(0x60));
+    let name_len = builder.add(cbor[0], str_tag);
+    builder.range_check(name_len, 5);
+    ValueTarget {
+        elements: pod_str_hash(builder, &cbor[1..], name_len).elements,
+    }
 }
 
-pub struct DateTarget {
-    inner: StringDataTarget,
+fn int_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTarget {
+    // TODO: cbor[0] should be <= 27
+    // TODO: handle values > 2^16
+    builder.range_check(cbor[0], 5);
+    let c_24 = builder.constant(F::from_canonical_u32(24));
+    let c_25 = builder.constant(F::from_canonical_u32(25));
+    let c_256 = builder.constant(F::from_canonical_u32(0x100));
+    let is_24 = builder.is_equal(cbor[0], c_24);
+    let is_25 = builder.is_equal(cbor[0], c_25);
+    let value_2_bytes = builder.mul_add(c_256, cbor[1], cbor[2]);
+    let mut value = builder.select(is_24, cbor[1], cbor[0]);
+    value = builder.select(is_25, value_2_bytes, value);
+    let zero = builder.zero();
+    ValueTarget {
+        elements: [value, zero, zero, zero],
+    }
 }
 
-pub struct StringDataTarget {
-    hash: HashOutTarget,
+fn date_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTarget {
+    let header = [0xd9, 0x03, 0xec].map(F::from_canonical_u8);
+    let header_t = builder.constants(&header);
+    for (&c, h) in cbor.iter().zip(header_t.into_iter()) {
+        builder.connect(c, h);
+    }
+    string_from_cbor(builder, &cbor[3..])
 }
 
-pub struct IntDataTarget {
-    data: [Target; 4],
+fn set_field_string(
+    pw: &mut PartialWitness<F>,
+    field: &ValueTarget,
+    cbor: &[u8],
+) -> anyhow::Result<()> {
+    let item_tag = cbor[0];
+    let item_len = (item_tag & 0x1F) as usize;
+    if item_tag & 0xE0 != 0x60 || item_len > 23 {
+        anyhow::bail!("Expected a string of length <= 23");
+    }
+    let item_str = core::str::from_utf8(&cbor[1..][..item_len])?;
+    let name_hash = hash_str(item_str);
+    pw.set_target_arr(&field.elements, &name_hash.0)
 }
 
-impl DataTarget for StringDataTarget {
-    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self {
-        // TODO: the tag works differently if len > 23
-        let str_tag = builder.constant(-F::from_canonical_u8(0x60));
-        let name_len = builder.add(cbor[0], str_tag);
-        builder.range_check(name_len, 5);
-        Self {
-            hash: pod_str_hash(builder, &cbor[1..], name_len),
+fn set_field_int(
+    pw: &mut PartialWitness<F>,
+    field: &ValueTarget,
+    cbor: &[u8],
+) -> anyhow::Result<()> {
+    let value = match cbor[0] {
+        0..=23 => cbor[0] as u32,
+        24 => cbor[1] as u32,
+        25 => ((cbor[1] as u32) << 8) | (cbor[2] as u32),
+        _ => anyhow::bail!("Expected: integer between 0 and 65535"),
+    };
+    pw.set_target(field.elements[0], F::from_canonical_u32(value))
+}
+
+fn set_field_date(
+    pw: &mut PartialWitness<F>,
+    field: &ValueTarget,
+    cbor: &[u8],
+) -> anyhow::Result<()> {
+    set_field_string(pw, field, &cbor[3..])
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DataType {
+    String,
+    Int,
+    Date,
+}
+
+impl DataType {
+    pub fn field_from_cbor(
+        self,
+        builder: &mut CircuitBuilder<F, D>,
+        cbor: &[Target],
+    ) -> ValueTarget {
+        match self {
+            DataType::String => string_from_cbor(builder, cbor),
+            DataType::Int => int_from_cbor(builder, cbor),
+            DataType::Date => date_from_cbor(builder, cbor),
         }
     }
 
-    fn value_target(&self) -> ValueTarget {
-        ValueTarget {
-            elements: self.hash.elements,
-        }
-    }
-
-    fn set_target(
-        &self,
-        pw: &mut PartialWitness<GoldilocksField>,
+    pub fn set_field(
+        self,
+        pw: &mut PartialWitness<F>,
+        field: &ValueTarget,
         cbor: &[u8],
     ) -> anyhow::Result<()> {
-        let item_tag = cbor[0];
-        let item_len = (item_tag & 0x1F) as usize;
-        if item_tag & 0xE0 != 0x60 || item_len > 23 {
-            anyhow::bail!("Expected a string of length <= 23");
+        match self {
+            DataType::String => set_field_string(pw, field, cbor),
+            DataType::Int => set_field_int(pw, field, cbor),
+            DataType::Date => set_field_date(pw, field, cbor),
         }
-        let item_str = core::str::from_utf8(&cbor[1..][..item_len])?;
-        let name_hash = HashOut {
-            elements: hash_str(item_str).0,
-        };
-        pw.set_hash_target(self.hash, name_hash)
     }
 }
 
-impl DataTarget for IntDataTarget {
-    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self {
-        // TODO: cbor[0] should be <= 27
-        // TODO: handle values > 2^16
-        builder.range_check(cbor[0], 5);
-        let c_24 = builder.constant(F::from_canonical_u32(24));
-        let c_25 = builder.constant(F::from_canonical_u32(25));
-        let c_256 = builder.constant(F::from_canonical_u32(0x100));
-        let is_24 = builder.is_equal(cbor[0], c_24);
-        let is_25 = builder.is_equal(cbor[0], c_25);
-        let value_2_bytes = builder.mul_add(c_256, cbor[1], cbor[2]);
-        let mut value = builder.select(is_24, cbor[1], cbor[0]);
-        value = builder.select(is_25, value_2_bytes, value);
-        let zero = builder.zero();
-        Self {
-            data: [value, zero, zero, zero],
-        }
-    }
-
-    fn value_target(&self) -> ValueTarget {
-        ValueTarget {
-            elements: self.data,
-        }
-    }
-
-    fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()> {
-        let value = match cbor[0] {
-            0..=23 => cbor[0] as u32,
-            24 => cbor[1] as u32,
-            25 => ((cbor[1] as u32) << 8) | (cbor[2] as u32),
-            _ => anyhow::bail!("Expected: integer between 0 and 65535"),
-        };
-        pw.set_target(self.data[0], F::from_canonical_u32(value))
-    }
-}
-
-impl DataTarget for DateTarget {
-    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self {
-        let header = [0xd9, 0x03, 0xec].map(GoldilocksField::from_canonical_u8);
-        let header_t = builder.constants(&header);
-        for (&c, h) in cbor.iter().zip(header_t.into_iter()) {
-            builder.connect(c, h);
-        }
-        Self {
-            inner: StringDataTarget::from_cbor(builder, &cbor[3..]),
-        }
-    }
-
-    fn value_target(&self) -> ValueTarget {
-        self.inner.value_target()
-    }
-
-    fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()> {
-        self.inner.set_target(pw, &cbor[3..])
-    }
-}
-
-pub struct EntryTarget<T: DataTarget> {
+pub struct EntryTarget {
     cbor: Box<[Target; 128]>,
     prefix_offset_bits: [BoolTarget; 7],
-    data: T,
+    value: ValueTarget,
+    data_type: DataType,
     field_name: String,
 }
 
-impl<T: DataTarget> EntryTarget<T> {
-    pub fn new(builder: &mut CircuitBuilder<F, D>, field_name: &str) -> Self {
+impl EntryTarget {
+    pub fn new(builder: &mut CircuitBuilder<F, D>, field_name: &str, data_type: DataType) -> Self {
         let cbor = Box::new(core::array::from_fn(|_| {
             let t = builder.add_virtual_target();
             builder.range_check(t, 8);
@@ -305,24 +304,21 @@ impl<T: DataTarget> EntryTarget<T> {
             builder.connect(ch_t, ch_const);
         }
         let raw_data = &shifted_cbor[prefix.len()..];
-        let data = T::from_cbor(builder, raw_data);
+        let value = data_type.field_from_cbor(builder, raw_data);
         Self {
             cbor,
             prefix_offset_bits,
-            data,
+            value,
+            data_type,
             field_name: field_name.to_string(),
         }
     }
 
-    pub fn set_targets(
-        &self,
-        pw: &mut PartialWitness<GoldilocksField>,
-        cbor: &[u8],
-    ) -> anyhow::Result<()> {
+    pub fn set_targets(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()> {
         let mut cbor_padded = cbor.to_vec();
         sha_256_pad(&mut cbor_padded, 2)?;
         for (&ch_t, ch) in self.cbor.iter().zip_eq(cbor_padded.into_iter()) {
-            pw.set_target(ch_t, GoldilocksField::from_canonical_u8(ch))?;
+            pw.set_target(ch_t, F::from_canonical_u8(ch))?;
         }
         let name_prefix = prefix_for_key(&self.field_name);
         let prefix_offset = memchr::memmem::find(cbor, &name_prefix)
@@ -334,7 +330,8 @@ impl<T: DataTarget> EntryTarget<T> {
         let name_offset = prefix_offset + name_prefix.len();
         // TODO: The MDL spec allows strings of length up to 150.  But strings
         // of length > 23 use 2 bytes for the tag instead of 1.
-        self.data.set_target(pw, &cbor[name_offset..])
+        self.data_type
+            .set_field(pw, &self.value, &cbor[name_offset..])
     }
 }
 
@@ -350,7 +347,7 @@ mod test {
     };
 
     use super::parse_data;
-    use crate::mdlpod::parse::{DateTarget, EntryTarget, IntDataTarget, StringDataTarget};
+    use crate::mdlpod::parse::{DataType, EntryTarget};
 
     const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl_response.cbor");
 
@@ -368,7 +365,7 @@ mod test {
             .get("family_name")
             .ok_or_else(|| anyhow!("Could not find family name"))?;
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
-        let entry_t = EntryTarget::<StringDataTarget>::new(&mut builder, "family_name");
+        let entry_t = EntryTarget::new(&mut builder, "family_name", DataType::String);
         let data = builder.build::<PoseidonGoldilocksConfig>();
         let mut pw = PartialWitness::new();
         entry_t.set_targets(&mut pw, &family_name_entry.cbor)?;
@@ -385,7 +382,7 @@ mod test {
             .get("birth_date")
             .ok_or_else(|| anyhow!("Could not find birth date"))?;
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
-        let entry_t = EntryTarget::<DateTarget>::new(&mut builder, "birth_date");
+        let entry_t = EntryTarget::new(&mut builder, "birth_date", DataType::Date);
         let data = builder.build::<PoseidonGoldilocksConfig>();
         let mut pw = PartialWitness::new();
         entry_t.set_targets(&mut pw, &birth_date_entry.cbor)?;
@@ -401,7 +398,7 @@ mod test {
             .get("height")
             .ok_or_else(|| anyhow!("Could not find height"))?;
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
-        let entry_t = EntryTarget::<IntDataTarget>::new(&mut builder, "height");
+        let entry_t = EntryTarget::new(&mut builder, "height", DataType::Int);
         let data = builder.build::<PoseidonGoldilocksConfig>();
         let mut pw = PartialWitness::new();
         entry_t.set_targets(&mut pw, &height_entry.cbor)?;
