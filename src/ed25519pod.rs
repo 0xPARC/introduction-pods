@@ -27,11 +27,10 @@ use plonky2::{
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
 };
-use plonky2_ed25519::gadgets::eddsa::{EDDSATargets, fill_circuits, make_verify_circuits};
+use plonky2_ed25519::gadgets::eddsa::{fill_circuits, make_verify_circuits, EDDSATargets};
 use pod2::{
     backends::plonky2::{
-        Error, Result,
-        basetypes::{C, D, Proof},
+        basetypes::{Proof, VDSet, C, D},
         circuits::{
             common::{
                 CircuitBuilderPod, Flattenable, StatementArgTarget, StatementTarget, ValueTarget,
@@ -40,17 +39,17 @@ use pod2::{
         },
         deserialize_proof, mainpod,
         mainpod::{calculate_id, get_common_data},
-        serialize_proof,
+        serialize_proof, Error, Result,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, F, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId,
-        RawValue, RecursivePod, SELF, Statement, ToFields, Value,
+        self, AnchoredKey, Hash, Key, NativePredicate, Params, Pod, PodId, RawValue, RecursivePod,
+        Statement, ToFields, Value, F, KEY_TYPE, SELF,
     },
     timed,
 };
 use serde::{Deserialize, Serialize};
-use ssh_key::{SshSig, public::KeyData};
+use ssh_key::{public::KeyData, SshSig};
 
 use crate::PodType;
 
@@ -73,16 +72,16 @@ fn build_ed25519_verify() -> Result<(EDDSATargets, CircuitData<F, C, D>)> {
     Ok((ed25519_verify_target, data))
 }
 
-/// Circuit verifies a proof generated from the Ed25519_VERIFY_DATA circuit
+/// Circuit that verifies a proof generated from the Ed25519_VERIFY_DATA circuit.
 #[derive(Clone, Debug)]
 struct Ed25519PodVerifyTarget {
-    vds_root: HashOutTarget,
+    vd_root: HashOutTarget,
     id: HashOutTarget,
     proof: ProofWithPublicInputsTarget<D>,
 }
 
 pub struct Ed25519PodVerifyInput {
-    vds_root: Hash,
+    vd_root: Hash,
     id: PodId,
     proof: ProofWithPublicInputs<F, C, D>,
 }
@@ -114,13 +113,13 @@ impl Ed25519PodVerifyTarget {
         .eval(builder, &statements);
 
         // Register the public inputs
-        let vds_root = builder.add_virtual_hash();
+        let vd_root = builder.add_virtual_hash();
         builder.register_public_inputs(&id.elements);
-        builder.register_public_inputs(&vds_root.elements);
+        builder.register_public_inputs(&vd_root.elements);
 
         measure_gates_end!(builder, measure);
         Ed25519PodVerifyTarget {
-            vds_root,
+            vd_root,
             id,
             proof: proof_targ,
         }
@@ -128,8 +127,8 @@ impl Ed25519PodVerifyTarget {
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &Ed25519PodVerifyInput) -> Result<()> {
         pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
-        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
-        pw.set_target_arr(&self.vds_root.elements, &input.vds_root.0)?;
+        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0 .0.to_vec()))?;
+        pw.set_target_arr(&self.vd_root.elements, &input.vd_root.0)?;
 
         Ok(())
     }
@@ -143,7 +142,7 @@ pub struct Ed25519Pod {
     msg: Vec<u8>,
     pk: Vec<u8>,
     proof: Proof,
-    vds_root: Hash,
+    vd_set: VDSet,
 }
 
 impl RecursivePod for Ed25519Pod {
@@ -154,15 +153,15 @@ impl RecursivePod for Ed25519Pod {
     fn proof(&self) -> Proof {
         self.proof.clone()
     }
-    fn vds_root(&self) -> Hash {
-        self.vds_root
+    fn vd_set(&self) -> &VDSet {
+        &self.vd_set
     }
     fn deserialize_data(
         params: Params,
         data: serde_json::Value,
-        vds_root: Hash,
+        vd_set: VDSet,
         id: PodId,
-    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
+    ) -> Result<Box<dyn RecursivePod>> {
         let data: Data = serde_json::from_value(data)?;
         let common = get_common_data(&params)?;
         let proof = deserialize_proof(&common, &data.proof)?;
@@ -172,7 +171,7 @@ impl RecursivePod for Ed25519Pod {
             msg: data.msg,
             pk: data.pk,
             proof,
-            vds_root,
+            vd_set,
         }))
     }
 }
@@ -182,8 +181,31 @@ impl Pod for Ed25519Pod {
         &self.params
     }
 
-    fn verify(&self) -> Result<(), Box<DynError>> {
-        Ok(self._verify().map_err(Box::new)?)
+    fn verify(&self) -> Result<()> {
+        let statements = pub_self_statements(&self.msg, &self.pk)
+            .into_iter()
+            .map(mainpod::Statement::from)
+            .collect_vec();
+        let id: PodId = PodId(calculate_id(&statements, &self.params));
+        if id != self.id {
+            return Err(Error::id_not_equal(self.id, id));
+        }
+
+        let (_, circuit_data) = &*STANDARD_ED25519_POD_DATA;
+
+        let public_inputs = id
+            .to_fields(&self.params)
+            .iter()
+            .chain(self.vd_set().root().0.iter())
+            .cloned()
+            .collect_vec();
+
+        circuit_data
+            .verify(ProofWithPublicInputs {
+                proof: self.proof.clone(),
+                public_inputs,
+            })
+            .map_err(|e| Error::custom(format!("Ed25519Pod proof verification failure: {:?}", e)))
     }
 
     fn id(&self) -> PodId {
@@ -239,9 +261,9 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
 }
 
 impl Ed25519Pod {
-    fn _prove(
+    fn new(
         params: &Params,
-        vds_root: Hash,
+        vd_set: &VDSet,
         raw_msg: &str,
         sig: &SshSig,
         namespace: &str,
@@ -284,7 +306,7 @@ impl Ed25519Pod {
 
         // Set targets
         let input = Ed25519PodVerifyInput {
-            vds_root,
+            vd_root: vd_set.root(),
             id,
             proof: ed25519_verify_proof,
         };
@@ -308,46 +330,18 @@ impl Ed25519Pod {
             msg: signed_data,
             pk: pk.as_ref().to_vec(),
             proof: proof_with_pis.proof,
-            vds_root,
+            vd_set: vd_set.clone(),
         })
     }
 
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(
+    pub fn new_boxed(
         params: &Params,
-        vds_root: Hash,
+        vd_set: &VDSet,
         raw_msg: &str,
         sig: &SshSig,
         namespace: &str,
-    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
-        Ok(Self::_prove(params, vds_root, raw_msg, sig, namespace).map(Box::new)?)
-    }
-
-    fn _verify(&self) -> Result<()> {
-        let statements = pub_self_statements(&self.msg, &self.pk)
-            .into_iter()
-            .map(mainpod::Statement::from)
-            .collect_vec();
-        let id: PodId = PodId(calculate_id(&statements, &self.params));
-        if id != self.id {
-            return Err(Error::id_not_equal(self.id, id));
-        }
-
-        let (_, circuit_data) = &*STANDARD_ED25519_POD_DATA;
-
-        let public_inputs = id
-            .to_fields(&self.params)
-            .iter()
-            .chain(self.vds_root().0.iter())
-            .cloned()
-            .collect_vec();
-
-        circuit_data
-            .verify(ProofWithPublicInputs {
-                proof: self.proof.clone(),
-                public_inputs,
-            })
-            .map_err(|e| Error::custom(format!("Ed25519Pod proof verification failure: {:?}", e)))
+    ) -> Result<Box<dyn RecursivePod>> {
+        Ok(Self::new(params, vd_set, raw_msg, sig, namespace).map(Box::new)?)
     }
 }
 
@@ -472,7 +466,7 @@ pub mod tests {
 
         let ed25519_pod = timed!(
             "Ed25519Pod::new",
-            Ed25519Pod::new(&params, vdset.root(), msg, sig, namespace).unwrap()
+            Ed25519Pod::new_boxed(&params, &vdset, &msg, &sig, &namespace).unwrap()
         );
 
         Ok((ed25519_pod, params, vdset))
@@ -501,7 +495,7 @@ pub mod tests {
 
         // now generate a new MainPod from the ed25519_pod
         let mut main_pod_builder = MainPodBuilder::new(&params, &vdset);
-        main_pod_builder.add_main_pod(main_ed25519_pod.clone());
+        main_pod_builder.add_recursive_pod(main_ed25519_pod.clone());
 
         // add operation that ensures that the msg is as expected in the EcdsaPod
         let signed_data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig);
@@ -556,7 +550,7 @@ pub mod tests {
             .unwrap();
         let data = ed25519_pod.serialize_data();
         let recovered_ecdsa_pod =
-            Ed25519Pod::deserialize_data(params, data, vdset.root(), ed25519_pod.id).unwrap();
+            Ed25519Pod::deserialize_data(params, data, vdset, ed25519_pod.id).unwrap();
         let recovered_ed25519_pod = (recovered_ecdsa_pod as Box<dyn Any>)
             .downcast::<Ed25519Pod>()
             .unwrap();

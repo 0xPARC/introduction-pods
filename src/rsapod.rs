@@ -26,8 +26,7 @@ use plonky2_rsa::gadgets::{
 };
 use pod2::{
     backends::plonky2::{
-        Error, Result,
-        basetypes::{C, D, F},
+        basetypes::{VDSet, C, D, F},
         circuits::{
             common::{
                 CircuitBuilderPod, Flattenable, StatementArgTarget, StatementTarget, ValueTarget,
@@ -36,26 +35,23 @@ use pod2::{
         },
         deserialize_proof,
         mainpod::{self, calculate_id, get_common_data},
-        serialize_proof,
+        serialize_proof, Error, Result,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId,
-        Proof, RawValue, RecursivePod, SELF, Statement, ToFields, Value,
+        self, AnchoredKey, Hash, Key, NativePredicate, Params, Pod, PodId, Proof, RawValue,
+        RecursivePod, Statement, ToFields, Value, KEY_TYPE, SELF,
     },
     timed,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use ssh_key::{
-    Algorithm, HashAlg, Mpint, SshSig,
     public::{KeyData, RsaPublicKey},
+    Algorithm, HashAlg, Mpint, SshSig,
 };
 
-use crate::{
-    PodType,
-    //rsa::{BITS, BigUintTarget, RSA_LIMBS, RSATargets, build_rsa, set_rsa_targets},
-};
+use crate::PodType;
 
 const RSA_BYTE_SIZE: usize = 512;
 
@@ -71,7 +67,6 @@ fn mpint_to_biguint(x: &Mpint) -> BigUint {
     BigUint::from_bytes_be(x.as_positive_bytes().unwrap())
 }
 
-//#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Debug)]
 pub struct RSATargets {
     pub signature: BigUintTarget,
@@ -151,13 +146,13 @@ fn build_rsa_verify() -> Result<(RSATargets, CircuitData<F, C, D>)> {
 
 #[derive(Clone, Debug)]
 struct RsaPodVerifyTarget {
-    vds_root: HashOutTarget,
+    vd_root: HashOutTarget,
     id: HashOutTarget,
     proof: ProofWithPublicInputsTarget<D>,
 }
 
 struct RsaPodVerifyInput {
-    vds_root: Hash,
+    vd_root: Hash,
     id: PodId,
     proof: ProofWithPublicInputs<F, C, D>,
 }
@@ -193,13 +188,13 @@ impl RsaPodVerifyTarget {
         .eval(builder, &statements);
 
         // Register public inputs
-        let vds_root = builder.add_virtual_hash();
+        let vd_root = builder.add_virtual_hash();
         builder.register_public_inputs(&id.elements);
-        builder.register_public_inputs(&vds_root.elements);
+        builder.register_public_inputs(&vd_root.elements);
 
         measure_gates_end!(builder, measure);
         Self {
-            vds_root,
+            vd_root,
             id,
             proof: proof_targ,
         }
@@ -207,8 +202,8 @@ impl RsaPodVerifyTarget {
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &RsaPodVerifyInput) -> Result<()> {
         pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
-        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
-        pw.set_target_arr(&self.vds_root.elements, &input.vds_root.0)?;
+        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0 .0.to_vec()))?;
+        pw.set_target_arr(&self.vd_root.elements, &input.vd_root.0)?;
 
         Ok(())
     }
@@ -228,7 +223,7 @@ pub struct RsaPod {
     msg: Vec<u8>,
     pk: Vec<u8>,
     proof: Proof,
-    vds_root: Hash,
+    vd_set: VDSet,
 }
 
 impl RecursivePod for RsaPod {
@@ -239,15 +234,15 @@ impl RecursivePod for RsaPod {
     fn proof(&self) -> Proof {
         self.proof.clone()
     }
-    fn vds_root(&self) -> Hash {
-        self.vds_root
+    fn vd_set(&self) -> &VDSet {
+        &self.vd_set
     }
     fn deserialize_data(
         params: Params,
         data: serde_json::Value,
-        vds_root: Hash,
+        vd_set: VDSet,
         id: PodId,
-    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
+    ) -> Result<Box<dyn RecursivePod>> {
         let data: Data = serde_json::from_value(data)?;
         let common = get_common_data(&params)?;
         let proof = deserialize_proof(&common, &data.proof)?;
@@ -257,7 +252,7 @@ impl RecursivePod for RsaPod {
             msg: data.msg,
             pk: data.pk,
             proof,
-            vds_root,
+            vd_set,
         }))
     }
 }
@@ -279,9 +274,9 @@ fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
 }
 
 impl RsaPod {
-    fn _prove(
+    fn new(
         params: &Params,
-        vds_root: Hash,
+        vd_set: &VDSet,
         raw_msg: &str,
         sig: &SshSig,
         namespace: &str,
@@ -328,7 +323,7 @@ impl RsaPod {
 
         // Set targets
         let input = RsaPodVerifyInput {
-            vds_root,
+            vd_root: vd_set.root(),
             id,
             proof: rsa_verify_proof,
         };
@@ -353,22 +348,27 @@ impl RsaPod {
             msg: encoded_padded_data,
             pk: pk_bytes,
             proof: proof_with_pis.proof,
-            vds_root,
+            vd_set: vd_set.clone(),
         })
     }
 
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(
+    pub fn new_boxed(
         params: &Params,
-        vds_root: Hash,
+        vd_set: &VDSet,
         raw_msg: &str,
         sig: &SshSig,
         namespace: &str,
-    ) -> Result<Box<dyn Pod>, Box<DynError>> {
-        Ok(Self::_prove(params, vds_root, raw_msg, sig, namespace).map(Box::new)?)
+    ) -> Result<Box<dyn RecursivePod>> {
+        Ok(Self::new(params, vd_set, raw_msg, sig, namespace).map(Box::new)?)
+    }
+}
+
+impl Pod for RsaPod {
+    fn params(&self) -> &Params {
+        &self.params
     }
 
-    fn _verify(&self) -> Result<()> {
+    fn verify(&self) -> Result<()> {
         let statements = pub_self_statements(&self.msg, &self.pk)
             .into_iter()
             .map(mainpod::Statement::from)
@@ -383,7 +383,7 @@ impl RsaPod {
         let public_inputs = id
             .to_fields(&self.params)
             .iter()
-            .chain(self.vds_root().0.iter()) // slot for the unused vds root
+            .chain(self.vd_set().root().0.iter()) // slot for the unused vds root
             .cloned()
             .collect_vec();
 
@@ -393,16 +393,6 @@ impl RsaPod {
                 public_inputs,
             })
             .map_err(|e| Error::custom(format!("RSAPod proof verification failure: {:?}", e)))
-    }
-}
-
-impl Pod for RsaPod {
-    fn params(&self) -> &Params {
-        &self.params
-    }
-
-    fn verify(&self) -> Result<(), Box<DynError>> {
-        Ok(self._verify().map_err(Box::new)?)
     }
 
     fn id(&self) -> PodId {
@@ -546,16 +536,22 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
     let (hashed_data, digest_info): (Vec<u8>, Vec<u8>) = match ssh_sig.algorithm() {
         Algorithm::Rsa {
             hash: Some(HashAlg::Sha256),
-        } => (Sha256::digest(&encoded_data).to_vec(), vec![
-            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
-            0x01, 0x05, 0x00, 0x04, 0x20,
-        ]),
+        } => (
+            Sha256::digest(&encoded_data).to_vec(),
+            vec![
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x01, 0x05, 0x00, 0x04, 0x20,
+            ],
+        ),
         Algorithm::Rsa {
             hash: Some(HashAlg::Sha512),
-        } => (Sha512::digest(&encoded_data).to_vec(), vec![
-            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
-            0x03, 0x05, 0x00, 0x04, 0x40,
-        ]),
+        } => (
+            Sha512::digest(&encoded_data).to_vec(),
+            vec![
+                0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x03, 0x05, 0x00, 0x04, 0x40,
+            ],
+        ),
         _ => {
             return Err(Error::custom(String::from(
                 "rsa-sha2-256 and rsa-sha2-256 only",
@@ -598,7 +594,7 @@ pub mod tests {
 
     use super::*;
 
-    fn get_test_rsa_pod() -> Result<(Box<dyn Pod>, VDSet)> {
+    fn get_test_rsa_pod() -> Result<(Box<dyn RecursivePod>, VDSet)> {
         let params = Params {
             max_input_signed_pods: 0,
             ..Default::default()
@@ -614,19 +610,18 @@ pub mod tests {
                 .clone(),
             STANDARD_RSA_POD_DATA.1.verifier_only.clone(),
         ];
-        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
+        let vd_set = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
 
         // Use the sample data from plonky2_rsa
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/id_rsa_example.sig")).unwrap();
-        let vds_root = vdset.root();
 
         let rsa_pod = timed!(
             "RsaPod::new",
-            RsaPod::new(&params, vds_root, msg, &sig, namespace).unwrap()
+            RsaPod::new_boxed(&params, &vd_set.clone(), msg, &sig, namespace).unwrap()
         );
-        Ok((rsa_pod, vdset))
+        Ok((rsa_pod, vd_set))
     }
 
     #[test]
@@ -656,7 +651,7 @@ pub mod tests {
 
         // now generate a new MainPod from the rsa_pod
         let mut main_pod_builder = MainPodBuilder::new(&params, &vd_set);
-        main_pod_builder.add_main_pod(main_rsa_pod);
+        main_pod_builder.add_recursive_pod(main_rsa_pod);
 
         let mut prover = pod2::backends::plonky2::mock::mainpod::MockProver {};
         let pod = main_pod_builder.prove(&mut prover, &params).unwrap();
@@ -681,38 +676,43 @@ pub mod tests {
         let sig = SshSig::from_pem(include_bytes!("../test_keys/id_rsa_example.sig")).unwrap();
         let data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig).unwrap();
 
-        assert_eq!(data, vec![
-            0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            255, 255, 0, 48, 81, 48, 13, 6, 9, 96, 134, 72, 1, 101, 3, 4, 2, 3, 5, 0, 4, 64, 181,
-            197, 44, 214, 116, 75, 54, 39, 234, 42, 140, 208, 11, 206, 41, 35, 206, 205, 191, 120,
-            173, 54, 59, 138, 2, 32, 227, 203, 41, 241, 18, 139, 161, 89, 68, 192, 135, 58, 241,
-            130, 136, 20, 149, 230, 135, 249, 125, 234, 20, 202, 101, 48, 221, 110, 27, 245, 17,
-            102, 82, 107, 69, 88, 89, 51
-        ]);
+        assert_eq!(
+            data,
+            vec![
+                0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 48, 81, 48, 13, 6, 9, 96,
+                134, 72, 1, 101, 3, 4, 2, 3, 5, 0, 4, 64, 181, 197, 44, 214, 116, 75, 54, 39, 234,
+                42, 140, 208, 11, 206, 41, 35, 206, 205, 191, 120, 173, 54, 59, 138, 2, 32, 227,
+                203, 41, 241, 18, 139, 161, 89, 68, 192, 135, 58, 241, 130, 136, 20, 149, 230, 135,
+                249, 125, 234, 20, 202, 101, 48, 221, 110, 27, 245, 17, 102, 82, 107, 69, 88, 89,
+                51
+            ]
+        );
 
         Ok(())
     }
@@ -726,8 +726,7 @@ pub mod tests {
         let rsa_pod = (rsa_pod as Box<dyn Any>).downcast::<RsaPod>().unwrap();
         let data = rsa_pod.serialize_data();
         let recovered_rsa_pod =
-            RsaPod::deserialize_data(rsa_pod.params().clone(), data, vd_set.root(), rsa_pod.id())
-                .unwrap();
+            RsaPod::deserialize_data(rsa_pod.params().clone(), data, vd_set, rsa_pod.id()).unwrap();
         let recovered_rsa_pod = (recovered_rsa_pod as Box<dyn Any>)
             .downcast::<RsaPod>()
             .unwrap();
