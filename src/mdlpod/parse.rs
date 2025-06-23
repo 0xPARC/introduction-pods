@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use ciborium::{Value, from_reader};
 use itertools::Itertools;
 use plonky2::{
-    field::{extension::Extendable, goldilocks_field::GoldilocksField, types::Field},
+    field::{extension::Extendable, types::Field},
     hash::hash_types::{HashOut, HashOutTarget, RichField},
     iop::{
         target::{BoolTarget, Target},
@@ -12,13 +12,16 @@ use plonky2::{
     },
     plonk::circuit_builder::CircuitBuilder,
 };
-use pod2::middleware::{TypedValue, hash_str};
+use pod2::{
+    backends::plonky2::{
+        basetypes::{D, F},
+        circuits::common::{CircuitBuilderPod, StatementArgTarget, ValueTarget},
+    },
+    middleware::{TypedValue, hash_str},
+};
 use serde::Deserialize;
 
 use crate::gadgets::{hash_var_len::pod_str_hash, shift::shift_left};
-
-type F = GoldilocksField;
-const D: usize = 2;
 
 trait ValueLookup: Sized {
     fn get_key<'a, 'b>(&'a self, key: &'b str) -> anyhow::Result<&'a Self>;
@@ -71,13 +74,20 @@ fn pod_value_for(v: &Value) -> Option<TypedValue> {
         Value::Integer(n) => Some(TypedValue::Int(i64::try_from(*n).ok()?)),
         Value::Text(s) => Some(TypedValue::String(s.clone())),
         Value::Bool(b) => Some(TypedValue::Bool(*b)),
+        Value::Tag(1004, v) => match v.as_ref() {
+            Value::Text(s) => Some(TypedValue::String(s.clone())),
+            _ => None,
+        },
         _ => None,
     }
 }
 
 fn issuer_signed_item(entry: &Value) -> Option<MdlField> {
     let bytes = entry.get_tag(24).ok()?.get_bytes().ok()?;
+    //let val: Value = from_reader(bytes).unwrap();
+    //println!("value {val:?}");
     let item: MdlItem = from_reader(bytes).ok()?;
+    //println!("item {item:?}");
     pod_value_for(&item.elementValue).map(|v| MdlField {
         key: item.elementIdentifier,
         value: v,
@@ -107,9 +117,9 @@ pub struct MdlField {
 }
 
 pub struct MdlData {
-    mso: Vec<u8>,
-    signature: Vec<u8>,
-    data: BTreeMap<String, MdlField>,
+    pub mso: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub data: BTreeMap<String, MdlField>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -150,23 +160,27 @@ pub fn parse_data(data: &[u8]) -> anyhow::Result<MdlData> {
     })
 }
 
-pub fn sha_256_pad(v: &mut Vec<u8>) -> anyhow::Result<()> {
+pub fn sha_256_pad(v: &mut Vec<u8>, max_blocks: usize) -> anyhow::Result<()> {
     let sha_blocks = (v.len() + 9).div_ceil(64);
-    if sha_blocks > 2 {
-        anyhow::bail!("Expected message length <= 117");
+    if sha_blocks > max_blocks {
+        anyhow::bail!("Message too long");
     }
     let length: u64 = (v.len() * 8) as u64;
     v.push(0x80);
     v.resize(sha_blocks * 64 - 8, 0);
     v.extend(length.to_be_bytes());
-    v.resize(128, 0);
+    v.resize(max_blocks * 64, 0);
     Ok(())
 }
 
 pub trait DataTarget {
     fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self;
-
+    fn value_target(&self) -> ValueTarget;
     fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()>;
+}
+
+pub struct DateTarget {
+    inner: StringDataTarget,
 }
 
 pub struct StringDataTarget {
@@ -174,7 +188,7 @@ pub struct StringDataTarget {
 }
 
 pub struct IntDataTarget {
-    data: Target,
+    data: [Target; 4],
 }
 
 impl DataTarget for StringDataTarget {
@@ -185,6 +199,12 @@ impl DataTarget for StringDataTarget {
         builder.range_check(name_len, 5);
         Self {
             hash: pod_str_hash(builder, &cbor[1..], name_len),
+        }
+    }
+
+    fn value_target(&self) -> ValueTarget {
+        ValueTarget {
+            elements: self.hash.elements,
         }
     }
 
@@ -219,7 +239,16 @@ impl DataTarget for IntDataTarget {
         let value_2_bytes = builder.mul_add(c_256, cbor[1], cbor[2]);
         let mut value = builder.select(is_24, cbor[1], cbor[0]);
         value = builder.select(is_25, value_2_bytes, value);
-        Self { data: value }
+        let zero = builder.zero();
+        Self {
+            data: [value, zero, zero, zero],
+        }
+    }
+
+    fn value_target(&self) -> ValueTarget {
+        ValueTarget {
+            elements: self.data,
+        }
     }
 
     fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()> {
@@ -229,7 +258,28 @@ impl DataTarget for IntDataTarget {
             25 => ((cbor[1] as u32) << 8) | (cbor[2] as u32),
             _ => anyhow::bail!("Expected: integer between 0 and 65535"),
         };
-        pw.set_target(self.data, F::from_canonical_u32(value))
+        pw.set_target(self.data[0], F::from_canonical_u32(value))
+    }
+}
+
+impl DataTarget for DateTarget {
+    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self {
+        let header = [0xd9, 0x03, 0xec].map(GoldilocksField::from_canonical_u8);
+        let header_t = builder.constants(&header);
+        for (&c, h) in cbor.iter().zip(header_t.into_iter()) {
+            builder.connect(c, h);
+        }
+        Self {
+            inner: StringDataTarget::from_cbor(builder, &cbor[3..]),
+        }
+    }
+
+    fn value_target(&self) -> ValueTarget {
+        self.inner.value_target()
+    }
+
+    fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()> {
+        self.inner.set_target(pw, &cbor[3..])
     }
 }
 
@@ -270,7 +320,7 @@ impl<T: DataTarget> EntryTarget<T> {
         cbor: &[u8],
     ) -> anyhow::Result<()> {
         let mut cbor_padded = cbor.to_vec();
-        sha_256_pad(&mut cbor_padded)?;
+        sha_256_pad(&mut cbor_padded, 2)?;
         for (&ch_t, ch) in self.cbor.iter().zip_eq(cbor_padded.into_iter()) {
             pw.set_target(ch_t, GoldilocksField::from_canonical_u8(ch))?;
         }
@@ -300,7 +350,7 @@ mod test {
     };
 
     use super::parse_data;
-    use crate::mdlpod::parse::{EntryTarget, IntDataTarget, StringDataTarget};
+    use crate::mdlpod::parse::{DateTarget, EntryTarget, IntDataTarget, StringDataTarget};
 
     const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl_response.cbor");
 
@@ -322,6 +372,23 @@ mod test {
         let data = builder.build::<PoseidonGoldilocksConfig>();
         let mut pw = PartialWitness::new();
         entry_t.set_targets(&mut pw, &family_name_entry.cbor)?;
+        let proof = data.prove(pw)?;
+        data.verify(proof)
+    }
+
+    #[test]
+    fn test_date() -> anyhow::Result<()> {
+        let data = parse_data(CBOR_DATA)?;
+        println!("{:?}", data.data.keys());
+        let birth_date_entry = data
+            .data
+            .get("birth_date")
+            .ok_or_else(|| anyhow!("Could not find birth date"))?;
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let entry_t = EntryTarget::<DateTarget>::new(&mut builder, "birth_date");
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let mut pw = PartialWitness::new();
+        entry_t.set_targets(&mut pw, &birth_date_entry.cbor)?;
         let proof = data.prove(pw)?;
         data.verify(proof)
     }
