@@ -17,6 +17,9 @@ use serde::Deserialize;
 
 use crate::gadgets::{hash_var_len::pod_str_hash, shift::shift_left};
 
+type F = GoldilocksField;
+const D: usize = 2;
+
 trait ValueLookup: Sized {
     fn get_key<'a, 'b>(&'a self, key: &'b str) -> anyhow::Result<&'a Self>;
     fn get_index(&self, idx: usize) -> anyhow::Result<&Self>;
@@ -160,40 +163,72 @@ pub fn sha_256_pad(v: &mut Vec<u8>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub struct StringEntryTarget {
-    cbor: [Target; 128],
-    prefix_offset_bits: [BoolTarget; 7],
+pub trait DataTarget {
+    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self;
+
+    fn set_target(&self, pw: &mut PartialWitness<F>, cbor: &[u8]) -> anyhow::Result<()>;
+}
+
+pub struct StringDataTarget {
     hash: HashOutTarget,
+}
+
+impl DataTarget for StringDataTarget {
+    fn from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Self {
+        let str_tag = builder.constant(-F::from_canonical_u8(0x60));
+        let name_len = builder.add(cbor[0], str_tag);
+        Self {
+            hash: pod_str_hash(builder, &cbor[1..], name_len),
+        }
+    }
+
+    fn set_target(
+        &self,
+        pw: &mut PartialWitness<GoldilocksField>,
+        cbor: &[u8],
+    ) -> anyhow::Result<()> {
+        let item_tag = cbor[0];
+        let item_len = (item_tag & 0x1F) as usize;
+        if item_tag & 0xE0 != 0x60 || item_len > 23 {
+            anyhow::bail!("Expected a string of length <= 23");
+        }
+        let item_str = core::str::from_utf8(&cbor[1..][..item_len])?;
+        let name_hash = HashOut {
+            elements: hash_str(item_str).0,
+        };
+        pw.set_hash_target(self.hash, name_hash)
+    }
+}
+
+pub struct EntryTarget<T: DataTarget> {
+    cbor: Box<[Target; 128]>,
+    prefix_offset_bits: [BoolTarget; 7],
+    data: T,
     field_name: String,
 }
 
-impl StringEntryTarget {
-    pub fn new<F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-        field_name: &str,
-    ) -> Box<Self> {
-        let targets = Box::new(StringEntryTarget {
-            cbor: core::array::from_fn(|_| {
-                let t = builder.add_virtual_target();
-                builder.range_check(t, 8);
-                t
-            }),
-            prefix_offset_bits: core::array::from_fn(|_| builder.add_virtual_bool_target_safe()),
-            hash: builder.add_virtual_hash(),
-            field_name: field_name.to_string(),
-        });
-        let name_prefix = prefix_for_key(field_name);
-        let shifted_cbor = shift_left(builder, &targets.cbor, &targets.prefix_offset_bits);
-        for (&ch_t, &ch) in shifted_cbor.iter().zip(name_prefix.iter()) {
+impl<T: DataTarget> EntryTarget<T> {
+    pub fn new(builder: &mut CircuitBuilder<F, D>, field_name: &str) -> Self {
+        let cbor = Box::new(core::array::from_fn(|_| {
+            let t = builder.add_virtual_target();
+            builder.range_check(t, 8);
+            t
+        }));
+        let prefix_offset_bits = core::array::from_fn(|_| builder.add_virtual_bool_target_safe());
+        let prefix = prefix_for_key(field_name);
+        let shifted_cbor = shift_left(builder, cbor.as_ref(), &prefix_offset_bits);
+        for (&ch_t, &ch) in shifted_cbor.iter().zip(prefix.iter()) {
             let ch_const = builder.constant(F::from_canonical_u8(ch));
             builder.connect(ch_t, ch_const);
         }
-        let name_field = &shifted_cbor[name_prefix.len()..];
-        let str_tag = builder.constant(-F::from_canonical_u8(0x60));
-        let name_len = builder.add(name_field[0], str_tag);
-        let name_hash_t = pod_str_hash(builder, &name_field[1..], name_len);
-        builder.connect_hashes(targets.hash, name_hash_t);
-        targets
+        let raw_data = &shifted_cbor[prefix.len()..];
+        let data = T::from_cbor(builder, raw_data);
+        Self {
+            cbor,
+            prefix_offset_bits,
+            data,
+            field_name: field_name.to_string(),
+        }
     }
 
     pub fn set_targets(
@@ -216,17 +251,7 @@ impl StringEntryTarget {
         let name_offset = prefix_offset + name_prefix.len();
         // TODO: The MDL spec allows strings of length up to 150.  But strings
         // of length > 23 use 2 bytes for the tag instead of 1.
-        let item_tag = cbor[name_offset];
-        let item_len = (item_tag & 0x1F) as usize;
-        if item_tag & 0xE0 != 0x60 || item_len > 23 {
-            anyhow::bail!("Expected a string of length <= 23");
-        }
-        let item_str = core::str::from_utf8(&cbor[name_offset + 1..name_offset + 1 + item_len])?;
-        let name_hash = HashOut {
-            elements: hash_str(item_str).0,
-        };
-        pw.set_hash_target(self.hash, name_hash)?;
-        Ok(())
+        self.data.set_target(pw, &cbor[name_offset..])
     }
 }
 
@@ -242,7 +267,7 @@ mod test {
     };
 
     use super::parse_data;
-    use crate::mdlpod::parse::StringEntryTarget;
+    use crate::mdlpod::parse::{EntryTarget, StringDataTarget};
 
     const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl_response.cbor");
 
@@ -260,7 +285,7 @@ mod test {
             .get("family_name")
             .ok_or_else(|| anyhow!("Could not find family name"))?;
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
-        let entry_t = StringEntryTarget::new(&mut builder, "family_name");
+        let entry_t = EntryTarget::<StringDataTarget>::new(&mut builder, "family_name");
         let data = builder.build::<PoseidonGoldilocksConfig>();
         let mut pw = PartialWitness::new();
         entry_t.set_targets(&mut pw, &family_name_entry.cbor)?;
