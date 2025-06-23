@@ -17,7 +17,7 @@ use plonky2::{
         poseidon::PoseidonHash,
     },
     iop::{
-        target::Target,
+        target::{BoolTarget, Target},
         witness::{PartialWitness, WitnessWrite},
     },
     plonk::{
@@ -51,7 +51,7 @@ use pod2::{
 use serde::{Deserialize, Serialize};
 use ssh_key::{public::KeyData, SshSig};
 
-use crate::PodType;
+use crate::{utils::le_bits_to_bytes_targets, PodType};
 
 const KEY_SIGNED_MSG: &str = "signed_msg";
 const KEY_ED25519_PK: &str = "ed25519_pk";
@@ -102,8 +102,22 @@ impl Ed25519PodVerifyTarget {
         let pk_bits = &proof_targ.public_inputs[SIGNED_DATA_LEN * 8..SIGNED_DATA_LEN * 8 + 256];
 
         // Convert bits to bytes for hashing (group by 8 bits)
-        let msg_targets = bits_to_bytes_targets(builder, msg_bits);
-        let pk_targets = bits_to_bytes_targets(builder, pk_bits);
+        let msg_targets = le_bits_to_bytes_targets(
+            builder,
+            &msg_bits
+                .iter()
+                .rev()
+                .map(|b| BoolTarget::new_unsafe(*b)) // assuming that msg_bits contains only {0, 1}
+                .collect::<Vec<_>>(),
+        );
+        let pk_targets = le_bits_to_bytes_targets(
+            builder,
+            &pk_bits
+                .iter()
+                .rev()
+                .map(|b| BoolTarget::new_unsafe(*b)) // assuming that pk_bits contains only {0, 1}
+                .collect::<Vec<_>>(),
+        );
 
         // Calculate statements and ID
         let statements = pub_self_statements_target(builder, params, &msg_targets, &pk_targets);
@@ -343,30 +357,6 @@ impl Ed25519Pod {
     ) -> Result<Box<dyn RecursivePod>> {
         Ok(Self::new(params, vd_set, raw_msg, sig, namespace).map(Box::new)?)
     }
-}
-
-// Helper function to convert bit targets to byte targets
-fn bits_to_bytes_targets(builder: &mut CircuitBuilder<F, D>, bits: &[Target]) -> Vec<Target> {
-    assert_eq!(bits.len() % 8, 0);
-    let mut bytes = Vec::new();
-
-    for chunk in bits.chunks(8) {
-        // Convert 8 bits to a byte value
-        let mut byte_val = builder.zero();
-        let two = builder.two();
-        let mut power = builder.one();
-
-        // Little-endian bit order
-        for i in 0..8 {
-            let bit_val = builder.mul(chunk[7 - i], power);
-            byte_val = builder.add(byte_val, bit_val);
-            power = builder.mul(power, two);
-        }
-
-        bytes.push(byte_val);
-    }
-
-    bytes
 }
 
 fn type_statement() -> Statement {

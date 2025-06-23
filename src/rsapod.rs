@@ -51,7 +51,7 @@ use ssh_key::{
     Algorithm, HashAlg, Mpint, SshSig,
 };
 
-use crate::PodType;
+use crate::{utils::le_bits_to_bytes_targets, PodType};
 
 const RSA_BYTE_SIZE: usize = 512;
 
@@ -480,24 +480,6 @@ fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
     vec![st_type, st_msg, st_pk]
 }
 
-// Helper function to convert bit targets to byte targets
-fn le_bits_to_bytes_targets(
-    builder: &mut CircuitBuilder<F, D>,
-    bits: &[BoolTarget],
-) -> Vec<Target> {
-    assert_eq!(bits.len() % 8, 0);
-    let mut bytes = Vec::new();
-
-    for chunk in bits.chunks(8) {
-        let byte_val = builder.le_sum(chunk.iter());
-
-        bytes.push(byte_val);
-    }
-
-    bytes.reverse();
-    bytes
-}
-
 fn biguint_to_bits_targets(
     builder: &mut CircuitBuilder<F, D>,
     biguint: &BigUintTarget,
@@ -505,7 +487,7 @@ fn biguint_to_bits_targets(
 ) -> Vec<BoolTarget> {
     // Returns bits in little-endian order, i.e. least significant BIT first (this is NOT the same as little endian BYTE ordering)
     let false_target = builder._false();
-    let mut bits = Vec::new();
+    let mut bits: Vec<BoolTarget> = Vec::new();
     for limb in &biguint.limbs {
         bits.extend_from_slice(&builder.split_le(*limb, BITS));
     }
