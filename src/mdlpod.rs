@@ -71,21 +71,45 @@ use serde::{Deserialize, Serialize};
 use serde_cbor;
 use sha2::{Digest, Sha256};
 
-use crate::PodType;
+use crate::{
+    PodType,
+    mdlpod::parse::{DataType, EntryTarget},
+};
 
 const KEY_SIGNED_MSG: &str = "signed_msg";
 const KEY_P256_PK: &str = "p256_pk";
 
-static P256_VERIFY_DATA: LazyLock<(P256VerifyTarget, CircuitData<F, C, D>)> =
-    LazyLock::new(|| build_p256_verify().expect("successful build"));
+const MDL_FIELDS: &[(&str, DataType)] = &[
+    ("document_number", DataType::String),
+    ("expiry_date", DataType::Date),
+    ("family_name", DataType::String),
+    ("given_name", DataType::String),
+    ("birth_date", DataType::Date),
+    ("age_birth_year", DataType::Int),
+    ("sex", DataType::Int),
+    ("hair_colour", DataType::String),
+    ("eye_colour", DataType::String),
+    ("height", DataType::Int),
+    ("weight", DataType::Int),
+];
 
-fn build_p256_verify() -> Result<(P256VerifyTarget, CircuitData<F, C, D>)> {
+fn build_mdl_field_targets(builder: &mut CircuitBuilder<F, D>) -> Vec<EntryTarget> {
+    MDL_FIELDS
+        .iter()
+        .map(|(name, typ)| EntryTarget::new(builder, name, *typ))
+        .collect()
+}
+
+static P256_VERIFY_DATA: LazyLock<(P256VerifyTarget, CircuitData<F, C, D>)> =
+    LazyLock::new(|| build_p256_verify());
+
+fn build_p256_verify() -> (P256VerifyTarget, CircuitData<F, C, D>) {
     let config = CircuitConfig::wide_ecc_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
-    let p256_verify_target = P256VerifyTarget::add_targets(&mut builder)?;
+    let p256_verify_target = P256VerifyTarget::add_targets(&mut builder);
 
     let data = timed!("P256Verify build", builder.build::<C>());
-    Ok((p256_verify_target, data))
+    (p256_verify_target, data)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,7 +128,7 @@ struct P256VerifyTarget {
 }
 
 impl P256VerifyTarget {
-    fn add_targets(builder: &mut CircuitBuilder<F, D>) -> Result<Self> {
+    fn add_targets(builder: &mut CircuitBuilder<F, D>) -> Self {
         let measure = measure_gates_begin!(builder, "P256VerifyTarget");
 
         let max_msg_len_bits = 23160; // 2895 bytes * 8 bits
@@ -170,11 +194,11 @@ impl P256VerifyTarget {
         }
 
         measure_gates_end!(builder, measure);
-        Ok(P256VerifyTarget {
+        P256VerifyTarget {
             sha256_targets,
             pk,
             signature: sig,
-        })
+        }
     }
 
     fn set_targets(
