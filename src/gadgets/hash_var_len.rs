@@ -1,5 +1,5 @@
 use plonky2::{
-    field::{extension::Extendable, goldilocks_field::GoldilocksField, types::Field},
+    field::extension::Extendable,
     hash::{
         hash_types::{HashOutTarget, NUM_HASH_OUT_ELTS, RichField},
         hashing::PlonkyPermutation,
@@ -92,13 +92,13 @@ pub fn hash_variable_len<F: RichField + Extendable<D>, const D: usize, H: Algebr
 ///
 /// This function assumes that `data` has space for at least one
 /// byte of padding at the end.
-fn collapse_str(
-    builder: &mut CircuitBuilder<GoldilocksField, 2>,
+fn collapse_str<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
     data: &[Target],
     end_checks: &EndCheck,
 ) -> (Vec<Target>, Vec<BoolTarget>) {
     assert_eq!(data.len(), end_checks.past_end.len());
-    let factor = builder.constant(GoldilocksField::from_canonical_u32(0x100));
+    let factor = builder.constant(F::from_canonical_u32(0x100));
     let out_len = data.len().div_ceil(7);
     let mut out_data = Vec::new();
     let out_end_check: Vec<_> = (0..out_len)
@@ -130,13 +130,22 @@ fn collapse_str(
 /// pod2 string hash function, in circuit, with variable length strings
 ///
 /// Assumes that the string is strictly shorter than `data`.
-pub fn pod_str_hash(
-    builder: &mut CircuitBuilder<GoldilocksField, 2>,
+pub fn pod_str_hash<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    data: &[Target],
+    len: Target,
+) -> HashOutTarget {
+    let end_checks = compute_end_checks(builder, len, data.len());
+    pod_str_hash_with_end_check(builder, data, &end_checks)
+}
+
+pub fn pod_str_hash_with_end_check<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
     data: &[Target],
     end_checks: &EndCheck,
 ) -> HashOutTarget {
     let (collapsed, collapsed_end_check) = collapse_str(builder, data, end_checks);
-    hash_variable_len::<_, 2, PoseidonHash>(builder, &collapsed, &collapsed_end_check)
+    hash_variable_len::<F, D, PoseidonHash>(builder, &collapsed, &collapsed_end_check)
 }
 
 #[cfg(test)]
@@ -196,8 +205,7 @@ mod test {
             let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
             let msg_t = builder.add_virtual_targets(max_len);
             let msg_len_t = builder.add_virtual_target();
-            let end_check_t = compute_end_checks(&mut builder, msg_len_t, max_len);
-            let hash_t = pod_str_hash(&mut builder, &msg_t, &end_check_t);
+            let hash_t = pod_str_hash(&mut builder, &msg_t, msg_len_t);
             let data = builder.build::<C>();
 
             let msg_bytes: Vec<u8> = std::iter::repeat_with(|| OsRng.gen_range(0..128))

@@ -2,8 +2,20 @@ use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use ciborium::{Value, from_reader};
-use pod2::middleware::TypedValue;
+use itertools::Itertools;
+use plonky2::{
+    field::{extension::Extendable, goldilocks_field::GoldilocksField, types::Field},
+    hash::hash_types::{HashOut, HashOutTarget, RichField},
+    iop::{
+        target::{BoolTarget, Target},
+        witness::{PartialWitness, WitnessWrite},
+    },
+    plonk::circuit_builder::CircuitBuilder,
+};
+use pod2::middleware::{TypedValue, hash_str};
 use serde::Deserialize;
+
+use crate::gadgets::{hash_var_len::pod_str_hash, shift::shift_left};
 
 trait ValueLookup: Sized {
     fn get_key<'a, 'b>(&'a self, key: &'b str) -> anyhow::Result<&'a Self>;
@@ -61,19 +73,34 @@ fn pod_value_for(v: &Value) -> Option<TypedValue> {
 }
 
 fn issuer_signed_item(entry: &Value) -> Option<MdlField> {
-    let item: MdlItem = from_reader(entry.get_tag(24).ok()?.get_bytes().ok()?).ok()?;
+    let bytes = entry.get_tag(24).ok()?.get_bytes().ok()?;
+    let item: MdlItem = from_reader(bytes).ok()?;
     pod_value_for(&item.elementValue).map(|v| MdlField {
         key: item.elementIdentifier,
         value: v,
-        random_data: item.random.clone(),
+        cbor: bytes.to_vec(),
+        digest_id: item.digestID,
+        random: item.random,
     })
+}
+
+pub fn prefix_for_key(key: &str) -> Vec<u8> {
+    assert!(key.len() < 24);
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"qelementIdentifier");
+    buf.push((key.len() as u8) | 0x60);
+    buf.extend(key.bytes());
+    buf.extend(b"lelementValue");
+    buf
 }
 
 #[derive(Debug, Clone)]
 pub struct MdlField {
     key: String,
     value: TypedValue,
-    random_data: Vec<u8>,
+    digest_id: u64,
+    random: Vec<u8>,
+    cbor: Vec<u8>,
 }
 
 pub struct MdlData {
@@ -120,13 +147,124 @@ pub fn parse_data(data: &[u8]) -> anyhow::Result<MdlData> {
     })
 }
 
+pub fn sha_256_pad(v: &mut Vec<u8>) -> anyhow::Result<()> {
+    let sha_blocks = (v.len() + 9).div_ceil(64);
+    if sha_blocks > 2 {
+        anyhow::bail!("Expected message length <= 117");
+    }
+    let length: u64 = (v.len() * 8) as u64;
+    v.push(0x80);
+    v.resize(sha_blocks * 64 - 8, 0);
+    v.extend(length.to_be_bytes());
+    v.resize(128, 0);
+    Ok(())
+}
+
+pub struct StringEntryTarget {
+    cbor: [Target; 128],
+    prefix_offset_bits: [BoolTarget; 7],
+    hash: HashOutTarget,
+    field_name: String,
+}
+
+impl StringEntryTarget {
+    pub fn new<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        field_name: &str,
+    ) -> Box<Self> {
+        let targets = Box::new(StringEntryTarget {
+            cbor: core::array::from_fn(|_| {
+                let t = builder.add_virtual_target();
+                builder.range_check(t, 8);
+                t
+            }),
+            prefix_offset_bits: core::array::from_fn(|_| builder.add_virtual_bool_target_safe()),
+            hash: builder.add_virtual_hash(),
+            field_name: field_name.to_string(),
+        });
+        let name_prefix = prefix_for_key(field_name);
+        let shifted_cbor = shift_left(builder, &targets.cbor, &targets.prefix_offset_bits);
+        for (&ch_t, &ch) in shifted_cbor.iter().zip(name_prefix.iter()) {
+            let ch_const = builder.constant(F::from_canonical_u8(ch));
+            builder.connect(ch_t, ch_const);
+        }
+        let name_field = &shifted_cbor[name_prefix.len()..];
+        let str_tag = builder.constant(-F::from_canonical_u8(0x60));
+        let name_len = builder.add(name_field[0], str_tag);
+        let name_hash_t = pod_str_hash(builder, &name_field[1..], name_len);
+        builder.connect_hashes(targets.hash, name_hash_t);
+        targets
+    }
+
+    pub fn set_targets(
+        &self,
+        pw: &mut PartialWitness<GoldilocksField>,
+        cbor: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut cbor_padded = cbor.to_vec();
+        sha_256_pad(&mut cbor_padded)?;
+        for (&ch_t, ch) in self.cbor.iter().zip_eq(cbor_padded.into_iter()) {
+            pw.set_target(ch_t, GoldilocksField::from_canonical_u8(ch))?;
+        }
+        let name_prefix = prefix_for_key(&self.field_name);
+        let prefix_offset = memchr::memmem::find(cbor, &name_prefix)
+            .ok_or_else(|| anyhow!("Could not find entry"))
+            .unwrap();
+        for (n, &b) in self.prefix_offset_bits.iter().enumerate() {
+            pw.set_bool_target(b, (prefix_offset >> n) & 1 != 0)?;
+        }
+        let name_offset = prefix_offset + name_prefix.len();
+        // TODO: The MDL spec allows strings of length up to 150.  But strings
+        // of length > 23 use 2 bytes for the tag instead of 1.
+        let item_tag = cbor[name_offset];
+        let item_len = (item_tag & 0x1F) as usize;
+        if item_tag & 0xE0 != 0x60 || item_len > 23 {
+            anyhow::bail!("Expected a string of length <= 23");
+        }
+        let item_str = core::str::from_utf8(&cbor[name_offset + 1..name_offset + 1 + item_len])?;
+        let name_hash = HashOut {
+            elements: hash_str(item_str).0,
+        };
+        pw.set_hash_target(self.hash, name_hash)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use anyhow::anyhow;
+    use plonky2::{
+        iop::witness::PartialWitness,
+        plonk::{
+            circuit_builder::CircuitBuilder, circuit_data::CircuitConfig,
+            config::PoseidonGoldilocksConfig,
+        },
+    };
+
     use super::parse_data;
+    use crate::mdlpod::parse::StringEntryTarget;
+
+    const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl_response.cbor");
 
     #[test]
     fn test_parse() -> anyhow::Result<()> {
-        parse_data(include_bytes!("../../test_keys/mdl_response.cbor"))?;
+        parse_data(CBOR_DATA)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_string_hash() -> anyhow::Result<()> {
+        let data = parse_data(CBOR_DATA)?;
+        let family_name_entry = data
+            .data
+            .get("family_name")
+            .ok_or_else(|| anyhow!("Could not find family name"))?;
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let entry_t = StringEntryTarget::new(&mut builder, "family_name");
+        let data = builder.build::<PoseidonGoldilocksConfig>();
+        let mut pw = PartialWitness::new();
+        entry_t.set_targets(&mut pw, &family_name_entry.cbor)?;
+        let proof = data.prove(pw)?;
+        data.verify(proof)
     }
 }
