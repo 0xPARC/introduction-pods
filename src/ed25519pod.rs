@@ -27,10 +27,11 @@ use plonky2::{
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
 };
-use plonky2_ed25519::gadgets::eddsa::{fill_circuits, make_verify_circuits, EDDSATargets};
+use plonky2_ed25519::gadgets::eddsa::{EDDSATargets, fill_circuits, make_verify_circuits};
 use pod2::{
     backends::plonky2::{
-        basetypes::{Proof, VDSet, C, D},
+        Error, Result,
+        basetypes::{C, D, Proof, VDSet},
         circuits::{
             common::{
                 CircuitBuilderPod, Flattenable, StatementArgTarget, StatementTarget, ValueTarget,
@@ -39,19 +40,19 @@ use pod2::{
         },
         deserialize_proof, mainpod,
         mainpod::{calculate_id, get_common_data},
-        serialize_proof, Error, Result,
+        serialize_proof,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, Hash, Key, NativePredicate, Params, Pod, PodId, RawValue, RecursivePod,
-        Statement, ToFields, Value, F, KEY_TYPE, SELF,
+        self, AnchoredKey, F, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId, RawValue,
+        RecursivePod, SELF, Statement, ToFields, Value,
     },
     timed,
 };
 use serde::{Deserialize, Serialize};
-use ssh_key::{public::KeyData, SshSig};
+use ssh_key::{SshSig, public::KeyData};
 
-use crate::{utils::le_bits_to_bytes_targets, PodType};
+use crate::{PodType, utils::le_bits_to_bytes_targets};
 
 const KEY_SIGNED_MSG: &str = "signed_msg";
 const KEY_ED25519_PK: &str = "ed25519_pk";
@@ -141,7 +142,7 @@ impl Ed25519PodVerifyTarget {
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &Ed25519PodVerifyInput) -> Result<()> {
         pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
-        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0 .0.to_vec()))?;
+        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
         pw.set_target_arr(&self.vd_root.elements, &input.vd_root.0)?;
 
         Ok(())

@@ -37,13 +37,14 @@ use plonky2_ecdsa::{
     gadgets::{
         biguint::WitnessBigUint,
         curve::CircuitBuilderCurve,
-        ecdsa::{verify_message_circuit, ECDSAPublicKeyTarget, ECDSASignatureTarget},
+        ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_message_circuit},
         nonnative::{CircuitBuilderNonNative, NonNativeTarget},
     },
 };
 use pod2::{
     backends::plonky2::{
-        basetypes::{Proof, VDSet, C, D},
+        Error, Result,
+        basetypes::{C, D, Proof, VDSet},
         circuits::{
             common::{
                 CircuitBuilderPod, Flattenable, StatementArgTarget, StatementTarget, ValueTarget,
@@ -52,12 +53,12 @@ use pod2::{
         },
         deserialize_proof, mainpod,
         mainpod::{calculate_id, get_common_data},
-        serialize_proof, Error, Result,
+        serialize_proof,
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, Hash, Key, NativePredicate, Params, Pod, PodId, RawValue, RecursivePod,
-        Statement, ToFields, Value, F, KEY_TYPE, SELF,
+        self, AnchoredKey, F, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId, RawValue,
+        RecursivePod, SELF, Statement, ToFields, Value,
     },
     timed,
 };
@@ -187,7 +188,7 @@ impl EcdsaPodVerifyTarget {
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &EcdsaPodVerifyInput) -> Result<()> {
         pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
-        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0 .0.to_vec()))?;
+        pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
         pw.set_target_arr(&self.vd_root.elements, &input.vd_root.0)?;
 
         Ok(())
@@ -480,7 +481,7 @@ pub mod tests {
 
     use plonky2_ecdsa::curve::{
         curve_types::{Curve, CurveScalar},
-        ecdsa::{sign_message, ECDSAPublicKey, ECDSASecretKey, ECDSASignature},
+        ecdsa::{ECDSAPublicKey, ECDSASecretKey, ECDSASignature, sign_message},
         secp256k1::Secp256K1,
     };
     use pod2::{self, frontend::MainPodBuilder, middleware::VDSet, op};
