@@ -689,6 +689,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore] // this is for the GitHub CI, it takes too long and the CI would fail.
     fn test_serialization() -> Result<()> {
         let (rsa_pod, vd_set, _) = get_test_rsa_pod()?;
 

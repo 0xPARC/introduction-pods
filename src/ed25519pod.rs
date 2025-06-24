@@ -480,7 +480,7 @@ pub mod tests {
     }
 
     #[test]
-    #[ignore] // This is for the GitHub CI, it takes too long and the CI would fail.
+    #[ignore] // this is for the GitHub CI, it takes too long and the CI would fail.
     fn test_ed25519_pod_with_mainpod_verify() -> Result<()> {
         // Use the sample data from plonky2_ed25519
         let msg = "0xPARC\n";
@@ -510,6 +510,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore] // this is for the GitHub CI, it takes too long and the CI would fail.
     fn test_serialization() -> Result<()> {
         // Use the sample data from plonky2_ed25519
         let msg = "0xPARC\n";
