@@ -262,7 +262,7 @@ impl RecursivePod for RsaPod {
     }
 }
 
-static STANDARD_RSA_POD_DATA: LazyLock<(RsaPodVerifyTarget, CircuitData<F, C, D>)> =
+pub static STANDARD_RSA_POD_DATA: LazyLock<(RsaPodVerifyTarget, CircuitData<F, C, D>)> =
     LazyLock::new(|| build().expect("successful build"));
 
 fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
