@@ -8,7 +8,7 @@
 //!   `standard_recursion_config` (135 wires), padded to match the
 //!   `RecursiveCircuit<MainPod>` configuration.
 
-use std::sync::LazyLock;
+use std::{any::Any, sync::LazyLock};
 
 use itertools::Itertools;
 use num::bigint::BigUint;
@@ -288,6 +288,17 @@ impl Pod for EcdsaPod {
         })
         .expect("serialization to json")
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn equals(&self, other: &dyn Pod) -> bool {
+        if let Some(other) = other.as_any().downcast_ref::<EcdsaPod>() {
+            self == other
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -484,7 +495,7 @@ pub mod tests {
         ecdsa::{ECDSAPublicKey, ECDSASecretKey, ECDSASignature, sign_message},
         secp256k1::Secp256K1,
     };
-    use pod2::{self, frontend::MainPodBuilder, middleware::VDSet, op};
+    use pod2::{self, middleware::VDSet};
 
     use super::*;
 
@@ -548,10 +559,10 @@ pub mod tests {
         Ok(())
     }
 
-    fn compute_new_ecdsa_pod(
-        sk: ECDSASecretKey<Secp256K1>,
-        msg: Secp256K1Scalar,
-    ) -> Result<(Box<dyn RecursivePod>, Params, VDSet)> {
+    fn get_test_ecdsa_pod() -> Result<(Box<dyn RecursivePod>, Params, VDSet, Secp256K1Scalar)> {
+        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
+        let msg = Secp256K1Scalar([321, 654, 987, 321]);
+
         // first generate all the circuits data so that it does not need to be
         // computed at further stages of the test (affecting the time reports)
         timed!(
@@ -582,87 +593,46 @@ pub mod tests {
                 .clone(),
             STANDARD_ECDSA_POD_DATA.1.verifier_only.clone(),
         ];
-        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
+        let vd_set = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
 
         // generate a new EcdsaPod from the given msg, pk, signature
         let ecdsa_pod = timed!(
             "EcdsaPod::new",
-            EcdsaPod::new_boxed(&params, &vdset, msg, pk, signature).unwrap()
+            EcdsaPod::new_boxed(&params, &vd_set, msg, pk, signature).unwrap()
         );
-        Ok((ecdsa_pod, params, vdset))
+        Ok((ecdsa_pod, params, vd_set, msg))
     }
 
     #[test]
     fn test_ecdsa_pod() -> Result<()> {
-        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
-        let msg = Secp256K1Scalar([321, 654, 987, 321]);
+        let (ecdsa_pod, params, vd_set, msg) = get_test_ecdsa_pod()?;
 
-        let (ecdsa_pod, params, vdset) = compute_new_ecdsa_pod(sk, msg)?;
-
-        ecdsa_pod.verify().unwrap();
-        // pod2::measure_gates_print!();
-
-        // wrap the ecdsa_pod in a 'MainPod' (RecursivePod)
-        let main_ecdsa_pod = pod2::frontend::MainPod {
-            pod: ecdsa_pod.clone(),
-            public_statements: ecdsa_pod.pub_statements(),
-            params: params.clone(),
-        };
-
-        // now generate a new MainPod from the ecdsa_pod
-        let mut main_pod_builder = MainPodBuilder::new(&params, &vdset);
-        main_pod_builder.add_recursive_pod(main_ecdsa_pod.clone());
-
-        // add operation that ensures that the msg is as expected in the EcdsaPod
+        // prepare the msg_hash as it will be checked in the 2nd iteration
+        // MainPod in the pod operation
         let msg_limbs = secp_field_to_limbs(msg.0);
         let msg_hash = PoseidonHash::hash_no_pad(&msg_limbs);
-        let msg_copy = main_pod_builder
-            .pub_op(op!(
-                new_entry,
-                KEY_SIGNED_MSG,
-                Value::from(RawValue(msg_hash.elements))
-            ))
-            .unwrap();
-        main_pod_builder
-            .pub_op(op!(eq, (&main_ecdsa_pod, KEY_SIGNED_MSG), msg_copy))
-            .unwrap();
 
-        // perpetuate the pk
-        main_pod_builder
-            .pub_op(op!(copy, main_ecdsa_pod.public_statements[2].clone()))
-            .unwrap();
-
-        let mut prover = pod2::backends::plonky2::mock::mainpod::MockProver {};
-        let pod = main_pod_builder.prove(&mut prover, &params).unwrap();
-        assert!(pod.pod.verify().is_ok());
-
-        println!("going to prove the main_pod");
-        let mut prover = mainpod::Prover {};
-        let main_pod = timed!(
-            "main_pod_builder.prove",
-            main_pod_builder.prove(&mut prover, &params).unwrap()
-        );
-        let pod = (main_pod.pod as Box<dyn Any>)
-            .downcast::<mainpod::MainPod>()
-            .unwrap();
-        pod.verify().unwrap();
+        crate::tests::test_introduction_pod_signature_flow(
+            ecdsa_pod,
+            params,
+            vd_set,
+            KEY_SIGNED_MSG,
+            msg_hash,
+        )?;
 
         Ok(())
     }
 
     #[test]
     fn test_serialization() -> Result<()> {
-        let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
-        let msg = Secp256K1Scalar([321, 654, 987, 321]);
-
-        let (ecdsa_pod, params, vdset) = compute_new_ecdsa_pod(sk, msg)?;
+        let (ecdsa_pod, params, vd_set, _) = get_test_ecdsa_pod()?;
 
         ecdsa_pod.verify().unwrap();
 
         let ecdsa_pod = (ecdsa_pod as Box<dyn Any>).downcast::<EcdsaPod>().unwrap();
         let data = ecdsa_pod.serialize_data();
         let recovered_ecdsa_pod =
-            EcdsaPod::deserialize_data(params, data, vdset, ecdsa_pod.id).unwrap();
+            EcdsaPod::deserialize_data(params, data, vd_set, ecdsa_pod.id).unwrap();
         let recovered_ecdsa_pod = (recovered_ecdsa_pod as Box<dyn Any>)
             .downcast::<EcdsaPod>()
             .unwrap();

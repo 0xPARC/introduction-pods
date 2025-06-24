@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, sync::LazyLock};
+use std::{any::Any, cmp::Ordering, sync::LazyLock};
 
 use anyhow::anyhow;
 use itertools::Itertools;
@@ -68,6 +68,7 @@ fn mpint_to_biguint(x: &Mpint) -> BigUint {
     BigUint::from_bytes_be(x.as_positive_bytes().unwrap())
 }
 
+/// Circuit that checks a given RSA signature.
 #[derive(Clone, Debug)]
 pub struct RSATargets {
     pub signature: BigUintTarget,
@@ -145,6 +146,7 @@ fn build_rsa_verify() -> Result<(RSATargets, CircuitData<F, C, D>)> {
     Ok((rsa_pod_verify_target, data))
 }
 
+/// Circuit that verifies a proof generated from the RSATargets circuit.
 #[derive(Clone, Debug)]
 struct RsaPodVerifyTarget {
     vd_root: HashOutTarget,
@@ -416,6 +418,17 @@ impl Pod for RsaPod {
         })
         .expect("serialization to json")
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn equals(&self, other: &dyn Pod) -> bool {
+        if let Some(other) = other.as_any().downcast_ref::<RsaPod>() {
+            self == other
+        } else {
+            false
+        }
+    }
 }
 
 fn type_statement() -> Statement {
@@ -567,11 +580,11 @@ pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) 
 pub mod tests {
     use std::any::Any;
 
-    use pod2::{self, frontend::MainPodBuilder, middleware::VDSet};
+    use pod2::{self, middleware::VDSet};
 
     use super::*;
 
-    fn get_test_rsa_pod() -> Result<(Box<dyn RecursivePod>, VDSet)> {
+    fn get_test_rsa_pod() -> Result<(Box<dyn RecursivePod>, VDSet, Vec<u8>)> {
         let params = Params {
             max_input_signed_pods: 0,
             ..Default::default()
@@ -598,55 +611,36 @@ pub mod tests {
             "RsaPod::new",
             RsaPod::new_boxed(&params, &vd_set.clone(), msg, &sig, namespace).unwrap()
         );
-        Ok((rsa_pod, vd_set))
+        let encoded_padded_data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig)?;
+        Ok((rsa_pod, vd_set, encoded_padded_data))
     }
 
     #[test]
-    #[ignore] // This test is a subset of rsa_pod_with_mainpod_verify
-    fn rsa_pod_only_verify() -> Result<()> {
-        let (rsa_pod, _) = get_test_rsa_pod().unwrap();
-        rsa_pod.verify().unwrap();
-
-        Ok(())
-    }
-
-    #[test]
-    fn rsa_pod_with_mainpod_verify() -> Result<()> {
-        let (rsa_pod, vd_set) = get_test_rsa_pod().unwrap();
-        rsa_pod.verify().unwrap();
-
+    fn test_rsa_pod_with_mainpod_verify() -> Result<()> {
+        let (rsa_pod, vd_set, msg_encoded) = get_test_rsa_pod().unwrap();
         let params = rsa_pod.params().clone();
 
-        // wrap the rsa_pod in a 'MainPod' (RecursivePod)
-        let main_rsa_pod = pod2::frontend::MainPod {
-            pod: (rsa_pod.clone() as Box<dyn Any>)
-                .downcast::<RsaPod>()
-                .unwrap(),
-            public_statements: rsa_pod.pub_statements(),
-            params: params.clone(),
-        };
+        // prepare the msg_hash as it will be checked in the 2nd iteration
+        // MainPod in the pod operation
+        let msg_fields: Vec<F> = msg_encoded
+            .iter()
+            .map(|&b| F::from_canonical_u8(b))
+            .collect();
+        let msg_hash = PoseidonHash::hash_no_pad(&msg_fields);
 
-        // now generate a new MainPod from the rsa_pod
-        let mut main_pod_builder = MainPodBuilder::new(&params, &vd_set);
-        main_pod_builder.add_recursive_pod(main_rsa_pod);
-
-        let mut prover = pod2::backends::plonky2::mock::mainpod::MockProver {};
-        let pod = main_pod_builder.prove(&mut prover, &params).unwrap();
-        assert!(pod.pod.verify().is_ok());
-
-        println!("going to prove the main_pod");
-        let mut prover = mainpod::Prover {};
-        let main_pod = main_pod_builder.prove(&mut prover, &params).unwrap();
-        let pod = (main_pod.pod as Box<dyn Any>)
-            .downcast::<mainpod::MainPod>()
-            .unwrap();
-        pod.verify().unwrap();
+        crate::tests::test_introduction_pod_signature_flow(
+            rsa_pod,
+            params,
+            vd_set,
+            KEY_SIGNED_MSG,
+            msg_hash,
+        )?;
 
         Ok(())
     }
 
     #[test]
-    fn ssh_rsa_encode() -> Result<()> {
+    fn test_ssh_rsa_encode() -> Result<()> {
         // Only tests a signature generated with Sha512 as the inner hash algorithm and rsa-sha2-512 as the signature method.
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
@@ -690,8 +684,8 @@ pub mod tests {
     }
 
     #[test]
-    fn serialization() -> Result<()> {
-        let (rsa_pod, vd_set) = get_test_rsa_pod().unwrap();
+    fn test_serialization() -> Result<()> {
+        let (rsa_pod, vd_set, _) = get_test_rsa_pod()?;
 
         rsa_pod.verify().unwrap();
 

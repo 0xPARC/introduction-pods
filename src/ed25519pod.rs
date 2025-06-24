@@ -7,7 +7,7 @@
 //!   `standard_recursion_config`, padded to match the `RecursiveCircuit<MainPod>`
 //!   configuration.
 
-use std::sync::LazyLock;
+use std::{any::Any, sync::LazyLock};
 
 use itertools::Itertools;
 use plonky2::{
@@ -243,6 +243,17 @@ impl Pod for Ed25519Pod {
         })
         .expect("serialization to json")
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn equals(&self, other: &dyn Pod) -> bool {
+        if let Some(other) = other.as_any().downcast_ref::<Ed25519Pod>() {
+            self == other
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -428,12 +439,12 @@ fn pub_self_statements(msg: &[u8], pk: &[u8]) -> Vec<middleware::Statement> {
 pub mod tests {
     use std::any::Any;
 
-    use pod2::{self, frontend::MainPodBuilder, middleware::VDSet, op};
+    use pod2::{self, middleware::VDSet};
     use ssh_key::SshSig;
 
     use super::*;
 
-    fn compute_new_ecdsa_pod(
+    fn get_test_ed25519_pod(
         namespace: &str,
         msg: &str,
         sig: &SshSig,
@@ -471,56 +482,24 @@ pub mod tests {
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
 
-        let (ed25519_pod, params, vdset) = compute_new_ecdsa_pod(namespace, msg, &sig)?;
+        let (ed25519_pod, params, vdset) = get_test_ed25519_pod(namespace, msg, &sig)?;
 
-        ed25519_pod.verify().unwrap();
-
-        // wrap the ed25519_pod in a 'MainPod' (RecursivePod)
-        let main_ed25519_pod = pod2::frontend::MainPod {
-            pod: (ed25519_pod.clone() as Box<dyn Any>)
-                .downcast::<Ed25519Pod>()
-                .unwrap(),
-            public_statements: ed25519_pod.pub_statements(),
-            params: params.clone(),
-        };
-
-        // now generate a new MainPod from the ed25519_pod
-        let mut main_pod_builder = MainPodBuilder::new(&params, &vdset);
-        main_pod_builder.add_recursive_pod(main_ed25519_pod.clone());
-
-        // add operation that ensures that the msg is as expected in the EcdsaPod
+        // prepare the msg_hash as it will be checked in the 2nd iteration
+        // MainPod in the pod operation
         let signed_data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig);
         let msg_fields: Vec<F> = signed_data
             .iter()
             .map(|&b| F::from_canonical_u8(b))
             .collect();
         let msg_hash = PoseidonHash::hash_no_pad(&msg_fields);
-        let msg_copy = main_pod_builder
-            .pub_op(op!(
-                new_entry,
-                KEY_SIGNED_MSG,
-                Value::from(RawValue(msg_hash.elements))
-            ))
-            .unwrap();
-        main_pod_builder
-            .pub_op(op!(eq, (&main_ed25519_pod, KEY_SIGNED_MSG), msg_copy))
-            .unwrap();
-        // perpetuate the pk
-        main_pod_builder
-            .pub_op(op!(copy, main_ed25519_pod.public_statements[2].clone()))
-            .unwrap();
 
-        let mut prover = pod2::backends::plonky2::mock::mainpod::MockProver {};
-        let pod = main_pod_builder.prove(&mut prover, &params).unwrap();
-        assert!(pod.pod.verify().is_ok());
-
-        println!("going to prove the main_pod");
-        let mut prover = mainpod::Prover {};
-        let main_pod = main_pod_builder.prove(&mut prover, &params).unwrap();
-        let pod = (main_pod.pod as Box<dyn Any>)
-            .downcast::<mainpod::MainPod>()
-            .unwrap();
-        pod.verify().unwrap();
+        crate::tests::test_introduction_pod_signature_flow(
+            ed25519_pod,
+            params,
+            vdset,
+            KEY_SIGNED_MSG,
+            msg_hash,
+        )?;
 
         Ok(())
     }
@@ -532,7 +511,7 @@ pub mod tests {
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/ed25519_example.sig")).unwrap();
 
-        let (ed25519_pod, params, vdset) = compute_new_ecdsa_pod(namespace, msg, &sig)?;
+        let (ed25519_pod, params, vdset) = get_test_ed25519_pod(namespace, msg, &sig)?;
 
         ed25519_pod.verify().unwrap();
 
