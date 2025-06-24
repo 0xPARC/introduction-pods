@@ -150,7 +150,7 @@ fn build_rsa_verify() -> Result<(RSATargets, CircuitData<F, C, D>)> {
 }
 
 #[derive(Clone, Debug)]
-struct RsaPodVerifyTarget {
+pub struct RsaPodVerifyTarget {
     vds_root: HashOutTarget,
     id: HashOutTarget,
     proof: ProofWithPublicInputsTarget<D>,
