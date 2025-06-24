@@ -268,7 +268,12 @@ static STANDARD_ED25519_POD_DATA: LazyLock<(Ed25519PodVerifyTarget, CircuitData<
 
 fn build() -> Result<(Ed25519PodVerifyTarget, CircuitData<F, C, D>)> {
     let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
-    let config = CircuitConfig::standard_recursion_config();
+
+    // use pod2's recursion config as config for the introduction pod; which if
+    // the zk feature enabled, it will have the zk property enabled
+    let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
+    let config = rec_circuit_data.common.config.clone();
+
     let mut builder = CircuitBuilder::<F, D>::new(config);
     let ed25519_pod_verify_target = Ed25519PodVerifyTarget::add_targets(&mut builder, params);
     let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
