@@ -5,3 +5,4 @@ Repo that contains the introduction PODs for [pod2](https://github.com/0xPARC/po
 ### Acknowledgments
 - the EcdsaPod is based on the ECDSA signature verification originally implemented at https://github.com/0xPolygonZero/plonky2-ecdsa
 - the Ed25519Pod is based on the Ed25519 signature verification originally implemented at https://github.com/polymerdao/plonky2-ed25519
+- the RsaPod is based on the RSA signature verification originally implemented at https://github.com/dgulotta/plonky2-rsa
