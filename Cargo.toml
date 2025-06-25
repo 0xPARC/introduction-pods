@@ -14,7 +14,7 @@ ssh-key = { version = "0.6.7" }
 
 # we use a specific commit to avoid breaking changes in the interfaces, updating
 # to latest pod2 version from time to time.
-pod2 = { git="https://github.com/0xPARC/pod2", rev="e1775d8578364db773681614983dd2cce7c62d94" }
+pod2 = { git="https://github.com/0xPARC/pod2", rev="115c3c11524a0426a1b74db26ea0c78bf90bddb8" }
 
 # EcdsaPod specific dependencies:
 plonky2_ecdsa = {git = "https://github.com/ax0/plonky2-ecdsa"}
