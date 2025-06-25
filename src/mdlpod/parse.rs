@@ -23,7 +23,7 @@ use serde::Deserialize;
 
 use crate::gadgets::{hash_var_len::pod_str_hash, shift::shift_left};
 
-trait ValueLookup: Sized {
+pub trait ValueLookup: Sized {
     fn get_key<'a, 'b>(&'a self, key: &'b str) -> anyhow::Result<&'a Self>;
     fn get_index(&self, idx: usize) -> anyhow::Result<&Self>;
     fn get_bytes(&self) -> anyhow::Result<&[u8]>;
@@ -174,12 +174,15 @@ pub fn sha_256_pad(v: &mut Vec<u8>, max_blocks: usize) -> anyhow::Result<()> {
 }
 
 fn string_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTarget {
-    // TODO: the tag works differently if len > 23
     let str_tag = builder.constant(-F::from_canonical_u8(0x60));
-    let name_len = builder.add(cbor[0], str_tag);
+    let mut name_len = builder.add(cbor[0], str_tag);
+    let twenty_four = builder.constant(F::from_canonical_u32(24));
     builder.range_check(name_len, 5);
+    let len_is_24 = builder.is_equal(name_len, twenty_four);
+    name_len = builder.select(len_is_24, cbor[1], name_len);
+    let shifted = shift_left(builder, &cbor[1..], &[len_is_24]);
     ValueTarget {
-        elements: pod_str_hash(builder, &cbor[1..], name_len).elements,
+        elements: pod_str_hash(builder, &shifted, name_len).elements,
     }
 }
 
@@ -291,11 +294,9 @@ pub struct EntryTarget {
 
 impl EntryTarget {
     pub fn new(builder: &mut CircuitBuilder<F, D>, field_name: &str, data_type: DataType) -> Self {
-        let cbor = Box::new(core::array::from_fn(|_| {
-            let t = builder.add_virtual_target();
-            builder.range_check(t, 8);
-            t
-        }));
+        // don't need to range check cbor here, because it gets range checked
+        // when it's converted to bytes for the SHA256 hash
+        let cbor = Box::new(core::array::from_fn(|_| builder.add_virtual_target()));
         let prefix_offset_bits = core::array::from_fn(|_| builder.add_virtual_bool_target_safe());
         let prefix = prefix_for_key(field_name);
         let shifted_cbor = shift_left(builder, cbor.as_ref(), &prefix_offset_bits);
