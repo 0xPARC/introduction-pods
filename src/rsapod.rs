@@ -267,7 +267,7 @@ fn build() -> Result<(RsaPodVerifyTarget, CircuitData<F, C, D>)> {
     let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
 
     // use pod2's recursion config as config for the introduction pod; which if
-    // the zk feature enabled, it will have the zk property enabled
+    // the zk feature enabled, will have the zk property enabled
     let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
     let config = rec_circuit_data.common.config.clone();
 
