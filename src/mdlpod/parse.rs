@@ -84,6 +84,8 @@ fn pod_value_for(v: &Value) -> Option<TypedValue> {
 
 fn issuer_signed_item(entry: &Value) -> Option<MdlField> {
     let bytes = entry.get_tag(24).ok()?.get_bytes().ok()?;
+    let mut cbor = Vec::new();
+    ciborium::into_writer(entry, &mut cbor).ok()?;
     //let val: Value = from_reader(bytes).unwrap();
     //println!("value {val:?}");
     let item: MdlItem = from_reader(bytes).ok()?;
@@ -91,7 +93,7 @@ fn issuer_signed_item(entry: &Value) -> Option<MdlField> {
     pod_value_for(&item.elementValue).map(|v| MdlField {
         key: item.elementIdentifier,
         value: v,
-        cbor: bytes.to_vec(),
+        cbor,
         digest_id: item.digestID,
         random: item.random,
     })
@@ -173,7 +175,7 @@ pub fn sha_256_pad(v: &mut Vec<u8>, max_blocks: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn string_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTarget {
+fn string_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> (ValueTarget, Target) {
     let str_tag = builder.constant(-F::from_canonical_u8(0x60));
     let mut name_len = builder.add(cbor[0], str_tag);
     let twenty_four = builder.constant(F::from_canonical_u32(24));
@@ -181,12 +183,16 @@ fn string_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> Valu
     let len_is_24 = builder.is_equal(name_len, twenty_four);
     name_len = builder.select(len_is_24, cbor[1], name_len);
     let shifted = shift_left(builder, &cbor[1..], &[len_is_24]);
-    ValueTarget {
+    let value = ValueTarget {
         elements: pod_str_hash(builder, &shifted, name_len).elements,
-    }
+    };
+    let one = builder.one();
+    let tag_len = builder.add(one, len_is_24.target);
+    let total_len = builder.add(tag_len, name_len);
+    (value, total_len)
 }
 
-fn int_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTarget {
+fn int_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> (ValueTarget, Target) {
     // TODO: cbor[0] should be <= 27
     // TODO: handle values > 2^16
     builder.range_check(cbor[0], 5);
@@ -199,18 +205,26 @@ fn int_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTa
     let mut value = builder.select(is_24, cbor[1], cbor[0]);
     value = builder.select(is_25, value_2_bytes, value);
     let zero = builder.zero();
-    ValueTarget {
+    let value = ValueTarget {
         elements: [value, zero, zero, zero],
-    }
+    };
+    let two = builder.constant(F::TWO);
+    let mut len = builder.constant(F::ONE);
+    len = builder.add(is_24.target, len);
+    len = builder.mul_add(two, is_25.target, len);
+    (value, len)
 }
 
-fn date_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> ValueTarget {
+fn date_from_cbor(builder: &mut CircuitBuilder<F, D>, cbor: &[Target]) -> (ValueTarget, Target) {
     let header = [0xd9, 0x03, 0xec].map(F::from_canonical_u8);
     let header_t = builder.constants(&header);
     for (&c, h) in cbor.iter().zip(header_t.into_iter()) {
         builder.connect(c, h);
     }
-    string_from_cbor(builder, &cbor[3..])
+    let (value, string_len) = string_from_cbor(builder, &cbor[3..]);
+    let date_tag_len = builder.constant(F::from_canonical_u32(3));
+    let total_len = builder.add(date_tag_len, string_len);
+    (value, total_len)
 }
 
 fn set_field_string(
@@ -262,7 +276,7 @@ impl DataType {
         self,
         builder: &mut CircuitBuilder<F, D>,
         cbor: &[Target],
-    ) -> ValueTarget {
+    ) -> (ValueTarget, Target) {
         match self {
             DataType::String => string_from_cbor(builder, cbor),
             DataType::Int => int_from_cbor(builder, cbor),
@@ -285,11 +299,12 @@ impl DataType {
 }
 
 pub struct EntryTarget {
-    cbor: Box<[Target; 128]>,
-    prefix_offset_bits: [BoolTarget; 7],
-    value: ValueTarget,
-    data_type: DataType,
-    field_name: String,
+    pub cbor: Box<[Target; 128]>,
+    pub prefix_offset_bits: [BoolTarget; 7],
+    pub data_end_offset: Target,
+    pub value: ValueTarget,
+    pub data_type: DataType,
+    pub field_name: String,
 }
 
 impl EntryTarget {
@@ -305,10 +320,15 @@ impl EntryTarget {
             builder.connect(ch_t, ch_const);
         }
         let raw_data = &shifted_cbor[prefix.len()..];
-        let value = data_type.field_from_cbor(builder, raw_data);
+        let (value, data_len) = data_type.field_from_cbor(builder, raw_data);
+        let prefix_offset = builder.le_sum(prefix_offset_bits.iter());
+        let prefix_len = builder.constant(F::from_canonical_usize(prefix.len()));
+        let data_offset = builder.add(prefix_offset, prefix_len);
+        let data_end_offset = builder.add(data_offset, data_len);
         Self {
             cbor,
             prefix_offset_bits,
+            data_end_offset,
             value,
             data_type,
             field_name: field_name.to_string(),
@@ -329,15 +349,13 @@ impl EntryTarget {
             pw.set_bool_target(b, (prefix_offset >> n) & 1 != 0)?;
         }
         let name_offset = prefix_offset + name_prefix.len();
-        // TODO: The MDL spec allows strings of length up to 150.  But strings
-        // of length > 23 use 2 bytes for the tag instead of 1.
         self.data_type
             .set_field(pw, &self.value, &cbor[name_offset..])
     }
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use anyhow::anyhow;
     use plonky2::{
         iop::witness::PartialWitness,
@@ -348,9 +366,13 @@ mod test {
     };
 
     use super::parse_data;
-    use crate::mdlpod::parse::{DataType, EntryTarget};
+    use crate::mdlpod::parse::{DataType, EntryTarget, MdlData};
 
     const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl_response.cbor");
+
+    pub fn cbor_parsed() -> anyhow::Result<MdlData> {
+        parse_data(CBOR_DATA)
+    }
 
     #[test]
     fn test_parse() -> anyhow::Result<()> {

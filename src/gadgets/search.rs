@@ -22,6 +22,8 @@ use plonky2::{
     plonk::{circuit_builder::CircuitBuilder, config::PoseidonGoldilocksConfig},
 };
 
+use crate::gadgets::bits_bytes::set_bits_target_le;
+
 pub type F = GoldilocksField;
 pub const D: usize = 2;
 pub type C = PoseidonGoldilocksConfig;
@@ -182,10 +184,13 @@ impl LookupTarget {
         for (&s_t, &s) in self.proof.siblings.iter().zip(proof.siblings.iter()) {
             pw.set_hash_target(s_t, s)?;
         }
+        set_bits_target_le(pw, &self.index_bits, index as u64)
+        /*
         for (n, &t) in self.index_bits.iter().enumerate() {
             pw.set_bool_target(t, (index >> n) & 1 != 0)?;
         }
         Ok(())
+        */
     }
 }
 

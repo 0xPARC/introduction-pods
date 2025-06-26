@@ -9,8 +9,9 @@
 
 mod parse;
 
-use std::sync::LazyLock;
+use std::{collections::BTreeMap, sync::LazyLock};
 
+use anyhow::anyhow;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
 use num::bigint::BigUint;
@@ -21,15 +22,17 @@ use plonky2::{
         poseidon::PoseidonHash,
     },
     iop::{
-        target::Target,
+        target::{BoolTarget, Target},
         witness::{PartialWitness, WitnessWrite},
     },
     plonk::{
         circuit_builder::CircuitBuilder,
         circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData},
         config::Hasher,
+        plonk_common,
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
+    util::log2_ceil,
 };
 use plonky2_ecdsa::{
     curve::{
@@ -44,7 +47,10 @@ use plonky2_ecdsa::{
         nonnative::{CircuitBuilderNonNative, NonNativeTarget},
     },
 };
-use plonky2_sha256::circuit::{Sha256Targets, array_to_bits, make_circuits};
+use plonky2_sha256::circuit::{
+    Sha256Targets, VariableLengthSha256Targets, array_to_bits, fill_variable_length_circuits,
+    make_circuits,
+};
 use plonky2_u32::gadgets::arithmetic_u32::U32Target;
 use pod2::{
     backends::plonky2::{
@@ -73,13 +79,20 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     PodType,
-    mdlpod::parse::{DataType, EntryTarget},
+    gadgets::{
+        bits_bytes::{bits_to_bytes_be, bytes_to_bits_be, set_bits_target_le},
+        comparison::check_less_or_equal,
+        search::{LookupTarget, merkle_root_circuit, merkle_root_rabin_karp_circuit, merkle_tree},
+    },
+    mdlpod::parse::{DataType, EntryTarget, MdlData, MdlField, ValueLookup, sha_256_pad},
 };
 
 const KEY_SIGNED_MSG: &str = "signed_msg";
 const KEY_P256_PK: &str = "p256_pk";
 
-const MDL_FIELDS: &[(&str, DataType)] = &[
+type MDLFieldData<'a> = &'a [(&'a str, DataType)];
+
+const MDL_FIELDS: MDLFieldData<'static> = &[
     ("document_number", DataType::String),
     ("expiry_date", DataType::Date),
     ("family_name", DataType::String),
@@ -91,6 +104,11 @@ const MDL_FIELDS: &[(&str, DataType)] = &[
     ("eye_colour", DataType::String),
     ("height", DataType::Int),
     ("weight", DataType::Int),
+];
+
+const MDL_SHORT_TEST_FIELDS: MDLFieldData<'static> = &[
+    ("document_number", DataType::String),
+    //("height", DataType::Int),
 ];
 
 fn build_mdl_field_targets(builder: &mut CircuitBuilder<F, D>) -> Vec<EntryTarget> {
@@ -114,9 +132,275 @@ fn build_p256_verify() -> (P256VerifyTarget, CircuitData<F, C, D>) {
 
 #[derive(Serialize, Deserialize)]
 struct Data {
-    msg: Vec<u8>,
+    mdl_data: BTreeMap<String, Value>,
     pk: ECDSAPublicKey<P256>,
     proof: String,
+}
+
+fn bytes_to_u32_be(builder: &mut CircuitBuilder<F, D>, bytes: &[Target]) -> Vec<Target> {
+    assert!(bytes.len() % 4 == 0);
+    let zero = builder.zero();
+    bytes
+        .chunks(4)
+        .map(|chunk| {
+            let mut u32_val = zero;
+            for (i, &b) in chunk.iter().enumerate() {
+                let shift = builder.constant(F::from_canonical_u32(1 << (8 * (3 - i))));
+                u32_val = builder.mul_add(shift, b, u32_val);
+            }
+            u32_val
+        })
+        .collect()
+}
+
+struct MdlItemTarget {
+    entry: EntryTarget,
+    lookup: LookupTarget,
+    hash: VariableLengthSha256Targets,
+}
+
+struct MdlDocTarget {
+    mso: Vec<Target>,
+    mso_len: Target,
+    entries: Vec<MdlItemTarget>,
+}
+
+fn connect_entry_and_hash(
+    builder: &mut CircuitBuilder<F, D>,
+    entry: &EntryTarget,
+    hash: &VariableLengthSha256Targets,
+) {
+    let hash_msg_bytes = bits_to_bytes_be(builder, &hash.message);
+    builder.connect_slice(&hash_msg_bytes, &entry.cbor[..]);
+    let bytes_per_block = builder.constant(F::from_canonical_u32(64));
+    let max_allowed_end = builder.mul(bytes_per_block, hash.msg_blocks.0);
+    check_less_or_equal(
+        builder,
+        entry.data_end_offset,
+        max_allowed_end,
+        log2_ceil(hash.message.len()) - 3,
+    );
+}
+
+fn mso_search_for_hash(
+    builder: &mut CircuitBuilder<F, D>,
+    hash: &VariableLengthSha256Targets,
+) -> Vec<Target> {
+    let mut out = Vec::with_capacity(34);
+    // CBOR tag for a 32 byte string
+    out.extend([0x58, 0x20].map(|x| builder.constant(F::from_canonical_u8(x))));
+    let sha_bytes = bits_to_bytes_be(builder, &hash.digest);
+    out.extend(sha_bytes);
+    out
+}
+
+fn connect_mso_and_lookup(
+    builder: &mut CircuitBuilder<F, D>,
+    mso_len: Target,
+    mso_merkle_root: HashOutTarget,
+    lookup: &LookupTarget,
+) {
+    builder.connect_hashes(mso_merkle_root, lookup.root);
+    let digest_index = builder.le_sum(lookup.index_bits.iter());
+    let window_len = builder.constant(F::from_canonical_u32(34));
+    let digest_end = builder.add(digest_index, window_len);
+    check_less_or_equal(builder, digest_end, mso_len, SEARCH_TREE_DEPTH);
+}
+
+fn connect_doc_and_hash(
+    builder: &mut CircuitBuilder<F, D>,
+    doc: &MdlDocTarget,
+    hash: &VariableLengthSha256Targets,
+) {
+    let hash_bytes = bits_to_bytes_be(builder, &hash.message);
+    builder.connect_slice(&doc.mso, &hash_bytes[..doc.mso.len()]);
+    // 9 bytes of padding + 63 bytes for rounding up
+    let len_addition = builder.constant(F::from_canonical_u32(72));
+    let len_with_addition = builder.add(doc.mso_len, len_addition);
+    // 1 block = 64 bytes = 2^6 bytes
+    let (_, expected_blocks) = builder.split_low_high(len_with_addition, 6, SEARCH_TREE_DEPTH);
+    builder.connect(hash.msg_blocks.0, expected_blocks);
+}
+
+const SEARCH_TREE_DEPTH: usize = 12;
+const ENTRY_MAX_BYTES: usize = 128;
+const ENTRY_MAX_BITS: usize = ENTRY_MAX_BYTES * 8;
+const MSO_MAX_BLOCKS: usize = 48;
+const MSO_MAX_BYTES_PADDED: usize = MSO_MAX_BLOCKS * 64;
+const MSO_MAX_BITS_PADDED: usize = MSO_MAX_BYTES_PADDED * 8;
+const MSO_MAX_BYTES_UNPADDED: usize = MSO_MAX_BYTES_PADDED - 9;
+
+impl MdlDocTarget {
+    fn add_targets(builder: &mut CircuitBuilder<F, D>, fields: MDLFieldData<'_>) -> Self {
+        let mso_len = builder.add_virtual_target();
+        let mso = builder.add_virtual_targets(MSO_MAX_BYTES_UNPADDED);
+        let merkle_root = merkle_root_rabin_karp_circuit(builder, &mso, SEARCH_TREE_DEPTH, 34);
+        let mut entries = Vec::with_capacity(fields.len());
+        for (key, data_type) in fields {
+            let entry = EntryTarget::new(builder, key, *data_type);
+            let hash =
+                plonky2_sha256::circuit::make_variable_length_circuits(builder, ENTRY_MAX_BITS);
+            let lookup = LookupTarget::new(builder, SEARCH_TREE_DEPTH, 34);
+            connect_entry_and_hash(builder, &entry, &hash);
+            let search_string = mso_search_for_hash(builder, &hash);
+            builder.connect_slice(&lookup.data, &search_string);
+            connect_mso_and_lookup(builder, mso_len, merkle_root, &lookup);
+            entries.push(MdlItemTarget {
+                entry,
+                hash,
+                lookup,
+            });
+        }
+        MdlDocTarget {
+            mso,
+            mso_len,
+            entries,
+        }
+    }
+
+    fn set_targets(&self, pw: &mut PartialWitness<F>, data: &MdlData) -> anyhow::Result<()> {
+        let mut mso_padded = data.mso.clone();
+        sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
+        assert_eq!(self.mso.len() + 9, mso_padded.len());
+        let tree = merkle_tree(&mso_padded[..self.mso.len()], SEARCH_TREE_DEPTH, 34);
+        for entry_t in self.entries.iter() {
+            let entry = data
+                .data
+                .get(&entry_t.entry.field_name)
+                .ok_or_else(|| anyhow!("could not find entry for {}", &entry_t.entry.field_name))?;
+            entry_t.entry.set_targets(pw, &entry.cbor)?;
+            fill_variable_length_circuits::<_, 2>(
+                pw,
+                &entry.cbor,
+                entry_t.hash.message.len(),
+                &entry_t.hash,
+            )?;
+            let mut hasher = Sha256::new();
+            hasher.update(&entry.cbor);
+            let hash = hasher.finalize();
+            let index = memchr::memmem::find(&data.mso, &hash)
+                .ok_or_else(|| anyhow!("hash not found in mso"))?
+                - 2;
+            entry_t
+                .lookup
+                .set_targets_from_index(pw, &data.mso, index, &tree)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use anyhow::anyhow;
+    use itertools::Itertools;
+    use plonky2::{
+        field::types::Field,
+        iop::witness::{PartialWitness, WitnessWrite},
+        plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig},
+    };
+    use plonky2_sha256::circuit::{
+        Sha256Targets, fill_variable_length_circuits, make_variable_length_circuits,
+    };
+    use pod2::backends::plonky2::circuits::common::CircuitBuilderPod;
+    use sha2::{Digest, Sha256};
+
+    use super::{C, F};
+    use crate::{
+        gadgets::{
+            bits_bytes::bits_to_bytes_be,
+            search::{LookupTarget, merkle_root_rabin_karp_circuit, merkle_tree},
+        },
+        mdlpod::{
+            ENTRY_MAX_BITS, MDL_FIELDS, MDL_SHORT_TEST_FIELDS, MSO_MAX_BITS_PADDED, MSO_MAX_BLOCKS,
+            MSO_MAX_BYTES_PADDED, MdlDocTarget, SEARCH_TREE_DEPTH, connect_doc_and_hash,
+            connect_mso_and_lookup, mso_search_for_hash,
+            parse::{EntryTarget, sha_256_pad, test::cbor_parsed},
+        },
+    };
+
+    /*
+    #[test]
+    fn test_verify_mdl_basic() -> anyhow::Result<()> {
+        let mdl_data = cbor_parsed()?;
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let (key, data_type) = MDL_FIELDS[0];
+        let entry_t = EntryTarget::new(&mut builder, key, data_type);
+        let hash_t =
+            plonky2_sha256::circuit::make_variable_length_circuits(&mut builder, ENTRY_MAX_BITS);
+        let hash_bytes = bits_to_bytes_be(&mut builder, &hash_t.digest);
+        let mso_t = builder.add_virtual_targets(MSO_MAX_BYTES);
+        let mso_len_t = builder.add_virtual_target();
+        let root_t = merkle_root_rabin_karp_circuit(&mut builder, &mso_t, SEARCH_TREE_DEPTH, 34);
+        let search_string = mso_search_for_hash(&mut builder, &hash_t);
+        let lookup = LookupTarget::new(&mut builder, SEARCH_TREE_DEPTH, 34);
+        builder.connect_slice(&search_string, &lookup.data);
+        connect_mso_and_lookup(&mut builder, mso_len_t, root_t, &lookup);
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        let entry = mdl_data
+            .data
+            .get(key)
+            .ok_or_else(|| anyhow!("could not find entry for {}", key))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&entry.cbor);
+        let hash = hasher.finalize();
+        entry_t.set_targets(&mut pw, &entry.cbor)?;
+        fill_variable_length_circuits::<_, 2>(&mut pw, &entry.cbor, hash_t.message.len(), &hash_t)?;
+        for (b_t, b) in hash_bytes.iter().zip_eq(hash.iter()) {
+            pw.set_target(*b_t, F::from_canonical_u8(*b))?;
+        }
+        let mut mso_padded = mdl_data.mso.clone();
+        sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
+        for (b_t, b) in mso_t.iter().zip(mdl_data.mso.iter()) {
+            pw.set_target(*b_t, F::from_canonical_u8(*b))?;
+        }
+        let mut substring = vec![0x58, 0x20];
+        let tree = merkle_tree(&mso_padded, SEARCH_TREE_DEPTH, 34);
+        substring.extend(&hash);
+        lookup.set_targets_from_substring(&mut pw, &mdl_data.mso, &substring, &tree)?;
+        let proof = data.prove(pw)?;
+        data.verify(proof)
+    }
+    */
+
+    #[test]
+    fn test_verify_mdl_no_sig() -> anyhow::Result<()> {
+        let mdl_data = cbor_parsed()?;
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let doc = MdlDocTarget::add_targets(&mut builder, MDL_SHORT_TEST_FIELDS);
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        doc.set_targets(&mut pw, &mdl_data)?;
+        let mut mso_padded = mdl_data.mso.clone();
+        sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
+        for (&ch_t, ch) in doc.mso.iter().zip(mso_padded) {
+            pw.set_target(ch_t, F::from_canonical_u8(ch))?;
+        }
+        pw.set_target(doc.mso_len, F::from_canonical_usize(mdl_data.mso.len()))?;
+        let proof = data.prove(pw)?;
+        data.verify(proof)
+    }
+
+    #[test]
+    fn test_verify_mdl_with_sig() -> anyhow::Result<()> {
+        let mdl_data = cbor_parsed()?;
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let doc = MdlDocTarget::add_targets(&mut builder, MDL_SHORT_TEST_FIELDS);
+        let hash = make_variable_length_circuits(&mut builder, MSO_MAX_BITS_PADDED);
+        connect_doc_and_hash(&mut builder, &doc, &hash);
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        doc.set_targets(&mut pw, &mdl_data)?;
+        let mut mso_padded = mdl_data.mso.clone();
+        sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
+        for (&ch_t, ch) in doc.mso.iter().zip(mso_padded) {
+            pw.set_target(ch_t, F::from_canonical_u8(ch))?;
+        }
+        pw.set_target(doc.mso_len, F::from_canonical_usize(mdl_data.mso.len()))?;
+        fill_variable_length_circuits::<_, 2>(&mut pw, &mdl_data.mso, hash.message.len(), &hash)?;
+        let proof = data.prove(pw)?;
+        data.verify(proof)
+    }
 }
 
 /// Note: this circuit requires the CircuitConfig's standard_ecc_config or
@@ -221,6 +505,20 @@ impl P256VerifyTarget {
     }
 }
 
+fn biguint_from_array(arr: [u64; 4]) -> BigUint {
+    BigUint::from_slice(&[
+        arr[0] as u32,
+        (arr[0] >> 32) as u32,
+        arr[1] as u32,
+        (arr[1] >> 32) as u32,
+        arr[2] as u32,
+        (arr[2] >> 32) as u32,
+        arr[3] as u32,
+        (arr[3] >> 32) as u32,
+    ])
+}
+
+/*
 #[derive(Clone, Debug)]
 struct MdlPodVerifyTarget {
     vds_root: HashOutTarget,
@@ -279,7 +577,7 @@ impl MdlPodVerifyTarget {
 pub struct MdlPod {
     params: Params,
     id: PodId,
-    msg: Vec<u8>,
+    mdl_data: BTreeMap<String, Value>,
     pk: ECDSAPublicKey<P256>,
     proof: Proof,
     vds_root: Hash,
@@ -308,7 +606,7 @@ impl RecursivePod for MdlPod {
         Ok(Box::new(Self {
             params,
             id,
-            msg: data.msg,
+            mdl_data: data.mdl_data,
             pk: data.pk,
             proof,
             vds_root,
@@ -531,10 +829,7 @@ impl Pod for MdlPod {
     }
 
     fn pub_self_statements(&self) -> Vec<middleware::Statement> {
-        let digest = Sha256::digest(&self.msg);
-        let digest_bytes: [u8; 32] = digest.into();
-        let msg_scalar = P256Scalar(bytes_to_u64_array_be(&digest_bytes));
-        pub_self_statements(msg_scalar, self.pk)
+        pub_self_statements(&self.pk, &self.mdl_data)
     }
 
     fn pod_type(&self) -> (usize, &'static str) {
@@ -588,30 +883,35 @@ fn pub_self_statements_target(
     vec![st_type, st_msg, st_pk]
 }
 
+fn u64_array_statements(
+    key_base: &str,
+    arr: &[u64],
+) -> impl Iterator<Item = middleware::Statement> {
+    arr.iter().enumerate().map(move |(index, &data)| {
+        let key = format!("{}_{}", key_base, index);
+        Statement::equal(AnchoredKey::from((SELF, key)), Value::from(data as i64))
+    })
+}
+
+fn pk_statements(pk: &ECDSAPublicKey<P256>) -> impl Iterator<Item = middleware::Statement> {
+    u64_array_statements("pk.x", &pk.0.x.0).chain(u64_array_statements("pk.y", &pk.0.y.0))
+}
+
+fn mdl_statements(data: &BTreeMap<String, Value>) -> impl Iterator<Item = middleware::Statement> {
+    data.iter()
+        .map(|(k, v)| Statement::equal(AnchoredKey::from((SELF, k)), v.clone()))
+}
+
 // compatible with the same method in-circuit (pub_self_statements_target)
-fn pub_self_statements(msg: P256Scalar, pk: ECDSAPublicKey<P256>) -> Vec<middleware::Statement> {
-    let st_type = type_statement();
-
-    // hash the msg as in-circuit
-    let msg_limbs = p256_field_to_limbs(msg.0);
-    let msg_hash = PoseidonHash::hash_no_pad(&msg_limbs);
-
-    let st_msg = Statement::equal(
-        AnchoredKey::from((SELF, KEY_SIGNED_MSG)),
-        Value::from(RawValue(msg_hash.elements)),
-    );
-
-    // hash the pk as in-circuit
-    let pk_x_limbs = p256_field_to_limbs(pk.0.x.0);
-    let pk_y_limbs = p256_field_to_limbs(pk.0.y.0);
-    let pk_hash = PoseidonHash::hash_no_pad(&[pk_x_limbs, pk_y_limbs].concat());
-
-    let st_pk = Statement::equal(
-        AnchoredKey::from((SELF, KEY_P256_PK)),
-        Value::from(RawValue(pk_hash.elements)),
-    );
-
-    vec![st_type, st_msg, st_pk]
+fn pub_self_statements(
+    pk: &ECDSAPublicKey<P256>,
+    mdl_data: &BTreeMap<String, Value>,
+) -> Vec<middleware::Statement> {
+    [type_statement()]
+        .into_iter()
+        .chain(pk_statements(pk))
+        .chain(mdl_statements(mdl_data))
+        .collect()
 }
 
 fn p256_field_to_limbs(v: [u64; 4]) -> Vec<F> {
@@ -622,19 +922,6 @@ fn p256_field_to_limbs(v: [u64; 4]) -> Vec<F> {
     limbs.resize(max_num_limbs, 0);
     let limbs_f: Vec<F> = limbs.iter().map(|l| F::from_canonical_u32(*l)).collect();
     limbs_f
-}
-
-fn biguint_from_array(arr: [u64; 4]) -> BigUint {
-    BigUint::from_slice(&[
-        arr[0] as u32,
-        (arr[0] >> 32) as u32,
-        arr[1] as u32,
-        (arr[1] >> 32) as u32,
-        arr[2] as u32,
-        (arr[2] >> 32) as u32,
-        arr[3] as u32,
-        (arr[3] >> 32) as u32,
-    ])
 }
 
 #[cfg(test)]
@@ -1045,3 +1332,4 @@ pub mod tests {
         Ok(())
     }
 }
+*/
