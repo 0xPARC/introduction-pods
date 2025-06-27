@@ -382,11 +382,11 @@ impl Pod for RsaPod {
         let calculated_msg_bytes = build_ssh_signed_data(
             &self.namespace, 
             self.original_msg.as_bytes(), 
-            HashAlg::Sha256, 
-            Algorithm::Rsa { hash: Some(HashAlg::Sha256) }
+            HashAlg::Sha512, 
+            Algorithm::Rsa { hash: Some(HashAlg::Sha512) }
         ).unwrap();
         if calculated_msg_bytes != self.msg {
-            return Err(Error::custom("Original message and namespace does not map to hashed and padded message. Note that only Sha256 is supported.".to_string()));
+            return Err(Error::custom("Original message and namespace does not map to hashed and padded message. Note that only Sha512 is supported.".to_string()));
         }
 
         // The following code is actually checked by the ZKP
