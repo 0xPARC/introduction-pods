@@ -48,8 +48,7 @@ use pod2::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use ssh_key::{
-    Algorithm, HashAlg, Mpint, SshSig,
-    public::{KeyData, RsaPublicKey},
+    public::{KeyData, RsaPublicKey}, Algorithm, HashAlg, Mpint, PublicKey, SshSig
 };
 
 use crate::{PodType, utils::le_bits_to_bytes_targets};
@@ -212,10 +211,14 @@ impl RsaPodVerifyTarget {
     }
 }
 
+
 #[derive(Serialize, Deserialize)]
 struct Data {
     msg: Vec<u8>,
     pk: Vec<u8>,
+    original_msg: String,
+    original_pk: PublicKey,
+    namespace: String,
     proof: String,
 }
 
@@ -224,7 +227,10 @@ pub struct RsaPod {
     params: Params,
     id: PodId,
     msg: Vec<u8>,
+    original_msg: String,
     pk: Vec<u8>,
+    original_pk: PublicKey,
+    namespace: String,
     proof: Proof,
     vd_set: VDSet,
 }
@@ -253,7 +259,10 @@ impl RecursivePod for RsaPod {
             params,
             id,
             msg: data.msg,
+            original_msg: data.original_msg,
             pk: data.pk,
+            original_pk: data.original_pk,
+            namespace: data.namespace,
             proof,
             vd_set,
         }))
@@ -292,26 +301,10 @@ impl RsaPod {
         // Load signature into verification circuit
         let (rsa_verify_target, rsa_circuit_data) = &*RSA_VERIFY_DATA;
         let mut pw = PartialWitness::<F>::new();
-        let encoded_padded_data = build_ssh_signed_data(namespace, raw_msg.as_bytes(), sig)?;
+        let encoded_padded_data = build_ssh_signed_data(namespace, raw_msg.as_bytes(), sig.hash_alg(), sig.algorithm())?;
 
-        let pk = match sig.public_key() {
-            KeyData::Rsa(pk) => pk,
-            _ => {
-                return Err(Error::custom(String::from(
-                    "signature does not carry an Rsa key",
-                )));
-            }
-        };
-
-        let pk_bytes =
-            pk.n.as_positive_bytes()
-                .expect("Public key was negative")
-                .to_vec();
-        if pk_bytes.len() != RSA_BYTE_SIZE {
-            return Err(Error::custom(String::from(
-                "Public key was not the correct size",
-            )));
-        }
+        let key_data = sig.public_key();
+        let pk_bytes = key_data_to_bytes(key_data).unwrap();
 
         set_rsa_targets(&mut pw, rsa_verify_target, sig, &encoded_padded_data)?;
 
@@ -354,8 +347,11 @@ impl RsaPod {
             params: params.clone(),
             id,
             msg: encoded_padded_data,
+            original_msg: String::from(raw_msg),
             pk: pk_bytes,
+            original_pk: PublicKey::new(sig.public_key().clone(), ""),
             proof: proof_with_pis.proof,
+            namespace: String::from(namespace),
             vd_set: vd_set.clone(),
         })
     }
@@ -377,6 +373,23 @@ impl Pod for RsaPod {
     }
 
     fn verify(&self) -> Result<()> {
+        // The first block of code isn't checked by the ZKP
+        let calculated_pk_bytes = key_data_to_bytes(self.original_pk.key_data()).unwrap();
+        if calculated_pk_bytes != self.pk {
+            return Err(Error::custom("Public key modulus and original public key mismatch".to_string()));
+        }
+
+        let calculated_msg_bytes = build_ssh_signed_data(
+            &self.namespace, 
+            self.original_msg.as_bytes(), 
+            HashAlg::Sha256, 
+            Algorithm::Rsa { hash: Some(HashAlg::Sha256) }
+        ).unwrap();
+        if calculated_msg_bytes != self.msg {
+            return Err(Error::custom("Original message and namespace does not map to hashed and padded message. Note that only Sha256 is supported.".to_string()));
+        }
+
+        // The following code is actually checked by the ZKP
         let statements = pub_self_statements(&self.msg, &self.pk)
             .into_iter()
             .map(mainpod::Statement::from)
@@ -419,7 +432,10 @@ impl Pod for RsaPod {
         serde_json::to_value(Data {
             proof: serialize_proof(&self.proof),
             msg: self.msg.clone(),
+            original_msg: self.original_msg.clone(),
             pk: self.pk.clone(),
+            original_pk: self.original_pk.clone(),
+            namespace: self.namespace.clone(),
         })
         .expect("serialization to json")
     }
@@ -527,14 +543,40 @@ fn biguint_to_bits_targets(
     bits
 }
 
+
+fn key_data_to_bytes(key_data: &KeyData) -> Result<Vec<u8>>{
+    let pk = match key_data {
+        KeyData::Rsa(pk) => pk,
+        _ => {
+            return Err(Error::custom(String::from(
+                "signature does not carry an Rsa key",
+            )));
+        }
+    };
+
+
+    let pk_bytes =
+        pk.n.as_positive_bytes()
+            .expect("Public key was negative")
+            .to_vec();
+    if pk_bytes.len() != RSA_BYTE_SIZE {
+        return Err(Error::custom(String::from(
+            "Public key was not the correct size",
+        )));
+    }
+
+    Ok(pk_bytes)
+}
+
 /// Build SSH signed data format
-pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], ssh_sig: &SshSig) -> Result<Vec<u8>> {
+pub fn build_ssh_signed_data(namespace: &str, raw_msg: &[u8], hash_alg: HashAlg, alg: Algorithm) -> Result<Vec<u8>> {
     // Use the SSH library's built-in method to create the data to sign
-    let encoded_data = ssh_key::SshSig::signed_data(namespace, ssh_sig.hash_alg(), raw_msg)
+    let encoded_data = ssh_key::SshSig::signed_data(namespace, hash_alg, raw_msg)
         .expect("failed to build encoded SSH data");
 
+    
     // Hash the data to sign and generate the digest info
-    let (hashed_data, digest_info): (Vec<u8>, Vec<u8>) = match ssh_sig.algorithm() {
+    let (hashed_data, digest_info): (Vec<u8>, Vec<u8>) = match alg {
         Algorithm::Rsa {
             hash: Some(HashAlg::Sha256),
         } => (Sha256::digest(&encoded_data).to_vec(), vec![
@@ -616,7 +658,7 @@ pub mod tests {
             "RsaPod::new",
             RsaPod::new_boxed(&params, &vd_set.clone(), msg, &sig, namespace).unwrap()
         );
-        let encoded_padded_data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig)?;
+        let encoded_padded_data = build_ssh_signed_data(namespace, msg.as_bytes(), sig.hash_alg(), sig.algorithm())?;
         Ok((rsa_pod, vd_set, encoded_padded_data))
     }
 
@@ -650,7 +692,7 @@ pub mod tests {
         let msg = "0xPARC\n";
         let namespace = "double-blind.xyz";
         let sig = SshSig::from_pem(include_bytes!("../test_keys/id_rsa_example.sig")).unwrap();
-        let data = build_ssh_signed_data(namespace, msg.as_bytes(), &sig).unwrap();
+        let data = build_ssh_signed_data(namespace, msg.as_bytes(), sig.hash_alg(), sig.algorithm()).unwrap();
 
         assert_eq!(data, vec![
             0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
