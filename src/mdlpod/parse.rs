@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::anyhow;
-use ciborium::{Value, from_reader};
+use ciborium::{Value, from_reader, into_writer, value::Integer};
 use itertools::Itertools;
+use num::BigUint;
 use plonky2::{
     field::{extension::Extendable, types::Field},
     hash::hash_types::{HashOut, HashOutTarget, RichField},
@@ -12,6 +13,14 @@ use plonky2::{
     },
     plonk::circuit_builder::CircuitBuilder,
 };
+use plonky2_ecdsa::{
+    curve::{
+        curve_types::AffinePoint,
+        ecdsa::{ECDSAPublicKey, ECDSASignature, verify_message},
+        p256::P256,
+    },
+    field::{p256_base::P256Base, p256_scalar::P256Scalar},
+};
 use pod2::{
     backends::plonky2::{
         basetypes::{D, F},
@@ -20,11 +29,16 @@ use pod2::{
     middleware::{TypedValue, hash_str},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use ssh_key::public::EcdsaPublicKey;
 
 use crate::gadgets::{hash_var_len::pod_str_hash, shift::shift_left};
 
+const EXPECTED_BYTES: &[u8] = include_bytes!("../../expected_bytes");
+
 pub trait ValueLookup: Sized {
     fn get_key<'a, 'b>(&'a self, key: &'b str) -> anyhow::Result<&'a Self>;
+    fn get_int_key(&self, key: i64) -> anyhow::Result<&Self>;
     fn get_index(&self, idx: usize) -> anyhow::Result<&Self>;
     fn get_bytes(&self) -> anyhow::Result<&[u8]>;
     fn get_array(&self) -> anyhow::Result<&[Self]>;
@@ -38,6 +52,17 @@ impl ValueLookup for Value {
             .iter()
             .find_map(|(k, v)| match k {
                 Value::Text(s) if key == s => Some(v),
+                _ => None,
+            })
+            .ok_or(anyhow!("Missing key {key}"))
+    }
+
+    fn get_int_key(&self, key: i64) -> anyhow::Result<&Value> {
+        self.as_map()
+            .ok_or_else(|| anyhow!("Expected a map"))?
+            .iter()
+            .find_map(|(k, v)| match k {
+                Value::Integer(i) if &Integer::from(key) == i => Some(v),
                 _ => None,
             })
             .ok_or(anyhow!("Missing key {key}"))
@@ -119,8 +144,8 @@ pub struct MdlField {
 }
 
 pub struct MdlData {
-    pub mso: Vec<u8>,
-    pub signature: Vec<u8>,
+    pub signed_message: Vec<u8>,
+    pub signature: ECDSASignature<P256>,
     pub data: BTreeMap<String, MdlField>,
 }
 
@@ -135,6 +160,30 @@ struct MdlItem {
 
 const NAMESPACE_STRINGS: &[&str] = &["org.iso.18013.5.1", "org.iso.18013.5.1.aamva"];
 
+fn base_from_bytes(bytes: &[u8]) -> P256Base {
+    let value_biguint = BigUint::from_bytes_be(bytes);
+    P256Base::from_noncanonical_biguint(value_biguint)
+}
+
+pub(super) fn scalar_from_bytes(bytes: &[u8]) -> P256Scalar {
+    let scalar_biguint = BigUint::from_bytes_be(bytes);
+    P256Scalar::from_noncanonical_biguint(scalar_biguint)
+}
+
+pub fn sig_structure(issuer_auth: &[Value]) -> anyhow::Result<Vec<u8>> {
+    if issuer_auth.len() != 4 {
+        anyhow::bail!("incorrect issuerAuth length");
+    }
+    let context = Value::Text("Signature1".to_string());
+    let body_protected = issuer_auth[0].clone();
+    let external_aad = Value::Bytes(Vec::new());
+    let payload = issuer_auth[2].clone();
+    let sig_structure_obj = Value::Array(vec![context, body_protected, external_aad, payload]);
+    let mut sig_structure = Vec::new();
+    into_writer(&sig_structure_obj, &mut sig_structure)?;
+    Ok(sig_structure)
+}
+
 pub fn parse_data(data: &[u8]) -> anyhow::Result<MdlData> {
     let parsed: Value = from_reader(data)?;
     let issuer_signed = parsed
@@ -142,8 +191,8 @@ pub fn parse_data(data: &[u8]) -> anyhow::Result<MdlData> {
         .get_index(0)?
         .get_key("issuerSigned")?;
     let issuer_auth = issuer_signed.get_key("issuerAuth")?;
-    let mso = issuer_auth.get_index(2)?.get_bytes()?.to_vec();
-    let signature = issuer_auth.get_index(3)?.get_bytes()?.to_vec();
+    //let mso = issuer_auth.get_index(2)?.get_bytes()?.to_vec();
+    let signature_bytes = issuer_auth.get_index(3)?.get_bytes()?.to_vec();
     let namespaces = issuer_signed.get_key("nameSpaces")?;
     let mut entries: BTreeMap<String, MdlField> = BTreeMap::new();
     for ns_name in NAMESPACE_STRINGS {
@@ -155,8 +204,15 @@ pub fn parse_data(data: &[u8]) -> anyhow::Result<MdlData> {
             }
         }
     }
+    if signature_bytes.len() != 64 {
+        anyhow::bail!("Malformed signature");
+    }
+    let r = scalar_from_bytes(&signature_bytes[..32]);
+    let s = scalar_from_bytes(&signature_bytes[32..]);
+    let signature = ECDSASignature { r, s };
+    let signed_message = sig_structure(issuer_auth.get_array()?)?;
     Ok(MdlData {
-        mso,
+        signed_message,
         signature,
         data: entries,
     })
@@ -170,8 +226,13 @@ pub fn sha_256_pad(v: &mut Vec<u8>, max_blocks: usize) -> anyhow::Result<()> {
     let length: u64 = (v.len() * 8) as u64;
     v.push(0x80);
     v.resize(sha_blocks * 64 - 8, 0);
-    v.extend(length.to_be_bytes());
-    v.resize(max_blocks * 64, 0);
+    let desired_len = max_blocks * 64;
+    let length_bytes = length.to_be_bytes();
+    // For consistency with plonky2_sha256::circuit::fill_variable_length_circuits,
+    // we fill the space past the end by repeating the length of the message.
+    while v.len() < desired_len {
+        v.extend(length_bytes);
+    }
     Ok(())
 }
 

@@ -15,6 +15,7 @@ use anyhow::anyhow;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use itertools::Itertools;
 use num::bigint::BigUint;
+use p256::{PublicKey, elliptic_curve::sec1::ToEncodedPoint};
 use plonky2::{
     field::types::Field,
     hash::{
@@ -36,10 +37,11 @@ use plonky2::{
 };
 use plonky2_ecdsa::{
     curve::{
+        curve_types::AffinePoint,
         ecdsa::{ECDSAPublicKey, ECDSASignature},
         p256::P256,
     },
-    field::p256_scalar::P256Scalar,
+    field::{p256_base::P256Base, p256_scalar::P256Scalar},
     gadgets::{
         biguint::{BigUintTarget, WitnessBigUint},
         curve::CircuitBuilderCurve,
@@ -49,7 +51,7 @@ use plonky2_ecdsa::{
 };
 use plonky2_sha256::circuit::{
     Sha256Targets, VariableLengthSha256Targets, array_to_bits, fill_variable_length_circuits,
-    make_circuits,
+    make_circuits, make_variable_length_circuits,
 };
 use plonky2_u32::gadgets::arithmetic_u32::U32Target;
 use pod2::{
@@ -124,7 +126,7 @@ static P256_VERIFY_DATA: LazyLock<(P256VerifyTarget, CircuitData<F, C, D>)> =
 fn build_p256_verify() -> (P256VerifyTarget, CircuitData<F, C, D>) {
     let config = CircuitConfig::wide_ecc_config();
     let mut builder = CircuitBuilder::<F, D>::new(config);
-    let p256_verify_target = P256VerifyTarget::add_targets(&mut builder);
+    let p256_verify_target = P256VerifyTarget::add_targets(&mut builder, 23160);
 
     let data = timed!("P256Verify build", builder.build::<C>());
     (p256_verify_target, data)
@@ -159,6 +161,8 @@ struct MdlItemTarget {
     hash: VariableLengthSha256Targets,
 }
 
+// TODO: it turns out that the thing that is signed is not actually the mso,
+// but I haven't changed the variable names yet
 struct MdlDocTarget {
     mso: Vec<Target>,
     mso_len: Target,
@@ -229,9 +233,11 @@ const MSO_MAX_BLOCKS: usize = 48;
 const MSO_MAX_BYTES_PADDED: usize = MSO_MAX_BLOCKS * 64;
 const MSO_MAX_BITS_PADDED: usize = MSO_MAX_BYTES_PADDED * 8;
 const MSO_MAX_BYTES_UNPADDED: usize = MSO_MAX_BYTES_PADDED - 9;
+const MSO_MAX_BITS_UNPADDED: usize = MSO_MAX_BYTES_UNPADDED * 8;
 
 impl MdlDocTarget {
     fn add_targets(builder: &mut CircuitBuilder<F, D>, fields: MDLFieldData<'_>) -> Self {
+        let measure = measure_gates_begin!(builder, "MdlDocTarget");
         let mso_len = builder.add_virtual_target();
         let mso = builder.add_virtual_targets(MSO_MAX_BYTES_UNPADDED);
         let merkle_root = merkle_root_rabin_karp_circuit(builder, &mso, SEARCH_TREE_DEPTH, 34);
@@ -251,6 +257,7 @@ impl MdlDocTarget {
                 lookup,
             });
         }
+        measure_gates_end!(builder, measure);
         MdlDocTarget {
             mso,
             mso_len,
@@ -259,7 +266,7 @@ impl MdlDocTarget {
     }
 
     fn set_targets(&self, pw: &mut PartialWitness<F>, data: &MdlData) -> anyhow::Result<()> {
-        let mut mso_padded = data.mso.clone();
+        let mut mso_padded = data.signed_message.clone();
         sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
         assert_eq!(self.mso.len() + 9, mso_padded.len());
         let tree = merkle_tree(&mso_padded[..self.mso.len()], SEARCH_TREE_DEPTH, 34);
@@ -278,30 +285,81 @@ impl MdlDocTarget {
             let mut hasher = Sha256::new();
             hasher.update(&entry.cbor);
             let hash = hasher.finalize();
-            let index = memchr::memmem::find(&data.mso, &hash)
+            let index = memchr::memmem::find(&data.signed_message, &hash)
                 .ok_or_else(|| anyhow!("hash not found in mso"))?
                 - 2;
             entry_t
                 .lookup
-                .set_targets_from_index(pw, &data.mso, index, &tree)?;
+                .set_targets_from_index(pw, &data.signed_message, index, &tree)?;
         }
         Ok(())
     }
+}
+
+/// Convert a 32-byte **big-endian** array into four little-endian u64 limbs
+pub fn bytes_to_u64_array_be(bytes: &[u8; 32]) -> [u64; 4] {
+    let mut limbs = [0u64; 4];
+
+    for limb_idx in 0..4 {
+        let mut limb = 0u64;
+        for byte_idx in 0..8 {
+            // Take bytes from the *end* of the array first
+            let b = bytes[31 - (limb_idx * 8 + byte_idx)];
+            limb |= (b as u64) << (8 * byte_idx);
+        }
+        limbs[limb_idx] = limb;
+    }
+    limbs
+}
+
+fn public_key_from_bytes(bytes: &[u8]) -> anyhow::Result<ECDSAPublicKey<P256>> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&bytes)
+        .map_err(|e| anyhow!("Failed to parse PEM: {:?}", e))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
+        .map_err(|e| anyhow!("Failed to parse certificate: {:?}", e))?;
+    let pk_sec1 = cert.public_key().subject_public_key.data.as_ref();
+
+    // Parse SEC1 encoded public key
+    let pk = PublicKey::from_sec1_bytes(pk_sec1)
+        .map_err(|e| anyhow!("Failed to parse public key: {}", e))?;
+
+    let enc = pk.to_encoded_point(false);
+
+    let x_slice = enc.x().expect("x coordinate missing");
+    let y_slice = enc.y().expect("y coordinate missing");
+    let mut x_arr = [0u8; 32];
+    x_arr.copy_from_slice(x_slice);
+    let mut y_arr = [0u8; 32];
+    y_arr.copy_from_slice(y_slice);
+
+    let x = bytes_to_u64_array_be(&x_arr);
+    let y = bytes_to_u64_array_be(&y_arr);
+
+    Ok(ECDSAPublicKey(AffinePoint {
+        x: P256Base(x),
+        y: P256Base(y),
+        zero: false,
+    }))
 }
 
 #[cfg(test)]
 mod test {
     use anyhow::anyhow;
     use itertools::Itertools;
+    use p256::{NistP256, elliptic_curve::sec1::ToEncodedPoint};
     use plonky2::{
         field::types::Field,
         iop::witness::{PartialWitness, WitnessWrite},
         plonk::{circuit_builder::CircuitBuilder, circuit_data::CircuitConfig},
     };
-    use plonky2_sha256::circuit::{
-        Sha256Targets, fill_variable_length_circuits, make_variable_length_circuits,
+    use plonky2_ecdsa::curve::{
+        ecdsa::{ECDSAPublicKey, verify_message},
+        p256::P256,
     };
-    use pod2::backends::plonky2::circuits::common::CircuitBuilderPod;
+    use plonky2_sha256::circuit::{
+        Sha256Targets, array_to_bits, fill_variable_length_circuits, make_variable_length_circuits,
+    };
+    use pod2::{backends::plonky2::circuits::common::CircuitBuilderPod, middleware::DynError};
     use sha2::{Digest, Sha256};
 
     use super::{C, F};
@@ -311,10 +369,12 @@ mod test {
             search::{LookupTarget, merkle_root_rabin_karp_circuit, merkle_tree},
         },
         mdlpod::{
-            ENTRY_MAX_BITS, MDL_FIELDS, MDL_SHORT_TEST_FIELDS, MSO_MAX_BITS_PADDED, MSO_MAX_BLOCKS,
-            MSO_MAX_BYTES_PADDED, MdlDocTarget, SEARCH_TREE_DEPTH, connect_doc_and_hash,
+            ENTRY_MAX_BITS, MDL_FIELDS, MDL_SHORT_TEST_FIELDS, MSO_MAX_BITS_PADDED,
+            MSO_MAX_BITS_UNPADDED, MSO_MAX_BLOCKS, MSO_MAX_BYTES_PADDED, MSO_MAX_BYTES_UNPADDED,
+            MdlDocTarget, P256VerifyTarget, SEARCH_TREE_DEPTH, connect_doc_and_hash,
             connect_mso_and_lookup, mso_search_for_hash,
-            parse::{EntryTarget, sha_256_pad, test::cbor_parsed},
+            parse::{EntryTarget, MdlData, scalar_from_bytes, sha_256_pad, test::cbor_parsed},
+            public_key_from_bytes,
         },
     };
 
@@ -363,6 +423,29 @@ mod test {
     }
     */
 
+    fn fill_vl(msg: &[u8], max_total_bits: usize) -> Vec<u8> {
+        let msg_bits = array_to_bits(msg);
+        let msg_blocks = (msg_bits.len() + 65 + 511) / 512;
+        let msg_bits_len = msg_bits.len();
+        let mut msg_bytes = vec![0; max_total_bits / 8];
+        for i in 0..max_total_bits {
+            let bit = if i < msg_bits_len {
+                msg_bits[i]
+            } else if i == msg_bits_len {
+                true
+            } else if i >= msg_blocks * 512 - 64 {
+                // length encoding, big-endian
+                ((msg_bits_len >> (msg_blocks * 512 - i - 1)) & 1) == 1
+            } else {
+                false
+            };
+            if bit {
+                msg_bytes[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        msg_bytes
+    }
+
     #[test]
     fn test_verify_mdl_no_sig() -> anyhow::Result<()> {
         let mdl_data = cbor_parsed()?;
@@ -371,33 +454,56 @@ mod test {
         let data = builder.build::<C>();
         let mut pw = PartialWitness::new();
         doc.set_targets(&mut pw, &mdl_data)?;
-        let mut mso_padded = mdl_data.mso.clone();
+        let mut mso_padded = mdl_data.signed_message.clone();
         sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
         for (&ch_t, ch) in doc.mso.iter().zip(mso_padded) {
             pw.set_target(ch_t, F::from_canonical_u8(ch))?;
         }
-        pw.set_target(doc.mso_len, F::from_canonical_usize(mdl_data.mso.len()))?;
+        pw.set_target(
+            doc.mso_len,
+            F::from_canonical_usize(mdl_data.signed_message.len()),
+        )?;
         let proof = data.prove(pw)?;
         data.verify(proof)
+    }
+
+    fn verify_mdl_signature(mdl_data: &MdlData, pk: &ECDSAPublicKey<P256>) -> bool {
+        let digest = Sha256::digest(&mdl_data.signed_message);
+        let ecdsa_msg = scalar_from_bytes(&digest);
+        verify_message(ecdsa_msg, mdl_data.signature.clone(), *pk)
     }
 
     #[test]
     fn test_verify_mdl_with_sig() -> anyhow::Result<()> {
         let mdl_data = cbor_parsed()?;
-        let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
+        let pk = public_key_from_bytes(include_bytes!("../test_keys/mdl/issuer-cert.pem"))?;
+        if !verify_mdl_signature(&mdl_data, &pk) {
+            anyhow::bail!("Invalid signature form message");
+        }
+        let mut mso_padded = mdl_data.signed_message.clone();
+        sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
+        let mso_padded_check = fill_vl(&mdl_data.signed_message, MSO_MAX_BITS_PADDED);
+        assert_eq!(&mso_padded, &mso_padded_check);
+        let mut builder = CircuitBuilder::new(CircuitConfig::standard_ecc_config());
         let doc = MdlDocTarget::add_targets(&mut builder, MDL_SHORT_TEST_FIELDS);
-        let hash = make_variable_length_circuits(&mut builder, MSO_MAX_BITS_PADDED);
-        connect_doc_and_hash(&mut builder, &doc, &hash);
+        let sig = P256VerifyTarget::add_targets(&mut builder, MSO_MAX_BITS_PADDED);
+        connect_doc_and_hash(&mut builder, &doc, &sig.sha256_targets);
         let data = builder.build::<C>();
         let mut pw = PartialWitness::new();
         doc.set_targets(&mut pw, &mdl_data)?;
-        let mut mso_padded = mdl_data.mso.clone();
-        sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
         for (&ch_t, ch) in doc.mso.iter().zip(mso_padded) {
             pw.set_target(ch_t, F::from_canonical_u8(ch))?;
         }
-        pw.set_target(doc.mso_len, F::from_canonical_usize(mdl_data.mso.len()))?;
-        fill_variable_length_circuits::<_, 2>(&mut pw, &mdl_data.mso, hash.message.len(), &hash)?;
+        pw.set_target(
+            doc.mso_len,
+            F::from_canonical_usize(mdl_data.signed_message.len()),
+        )?;
+        sig.set_targets(
+            &mut pw,
+            mdl_data.signed_message.clone(),
+            pk,
+            mdl_data.signature,
+        )?;
         let proof = data.prove(pw)?;
         data.verify(proof)
     }
@@ -406,17 +512,16 @@ mod test {
 /// Note: this circuit requires the CircuitConfig's standard_ecc_config or
 /// wide_ecc_config.
 struct P256VerifyTarget {
-    sha256_targets: Sha256Targets,
+    sha256_targets: VariableLengthSha256Targets,
     pk: ECDSAPublicKeyTarget<P256>,
     signature: ECDSASignatureTarget<P256>,
 }
 
 impl P256VerifyTarget {
-    fn add_targets(builder: &mut CircuitBuilder<F, D>) -> Self {
+    fn add_targets(builder: &mut CircuitBuilder<F, D>, max_msg_len_bits: usize) -> Self {
         let measure = measure_gates_begin!(builder, "P256VerifyTarget");
 
-        let max_msg_len_bits = 23160; // 2895 bytes * 8 bits
-        let sha256_targets = make_circuits(builder, max_msg_len_bits);
+        let sha256_targets = make_variable_length_circuits(builder, max_msg_len_bits);
 
         // Pre-compute constants outside the closure
         let zero = builder.zero();
@@ -465,10 +570,12 @@ impl P256VerifyTarget {
 
         verify_p256_message_circuit(builder, msg.clone(), sig.clone(), pk.clone());
 
+        /*
         // register public inputs
         for l in msg.value.limbs.iter() {
             builder.register_public_input(l.0);
         }
+        */
         // register pk as public input
         for l in pk.0.x.value.limbs.iter() {
             builder.register_public_input(l.0);
@@ -492,10 +599,12 @@ impl P256VerifyTarget {
         pk: ECDSAPublicKey<P256>,
         signature: ECDSASignature<P256>,
     ) -> Result<()> {
-        let msg_bits = array_to_bits(&msg);
-        for (i, &bit) in msg_bits.iter().enumerate() {
-            pw.set_bool_target(self.sha256_targets.message[i], bit)?;
-        }
+        fill_variable_length_circuits::<_, 2>(
+            pw,
+            &msg,
+            self.sha256_targets.message.len(),
+            &self.sha256_targets,
+        )?;
         pw.set_biguint_target(&self.pk.0.x.value, &biguint_from_array(pk.0.x.0))?;
         pw.set_biguint_target(&self.pk.0.y.value, &biguint_from_array(pk.0.y.0))?;
         pw.set_biguint_target(&self.signature.r.value, &biguint_from_array(signature.r.0))?;
