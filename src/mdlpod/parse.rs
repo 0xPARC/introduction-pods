@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 
 use anyhow::anyhow;
-use ciborium::{Value, from_reader, into_writer, value::Integer};
+use ciborium::{Value, from_reader, into_writer};
 use itertools::Itertools;
 use num::BigUint;
 use plonky2::{
-    field::{extension::Extendable, types::Field},
-    hash::hash_types::{HashOut, HashOutTarget, RichField},
+    field::types::Field,
     iop::{
         target::{BoolTarget, Target},
         witness::{PartialWitness, WitnessWrite},
@@ -14,31 +13,22 @@ use plonky2::{
     plonk::circuit_builder::CircuitBuilder,
 };
 use plonky2_ecdsa::{
-    curve::{
-        curve_types::AffinePoint,
-        ecdsa::{ECDSAPublicKey, ECDSASignature, verify_message},
-        p256::P256,
-    },
-    field::{p256_base::P256Base, p256_scalar::P256Scalar},
+    curve::{ecdsa::ECDSASignature, p256::P256},
+    field::p256_scalar::P256Scalar,
 };
 use pod2::{
     backends::plonky2::{
         basetypes::{D, F},
-        circuits::common::{CircuitBuilderPod, StatementArgTarget, ValueTarget},
+        circuits::common::ValueTarget,
     },
     middleware::{TypedValue, hash_str},
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use ssh_key::public::EcdsaPublicKey;
 
 use crate::gadgets::{hash_var_len::pod_str_hash, shift::shift_left};
 
-const EXPECTED_BYTES: &[u8] = include_bytes!("../../expected_bytes");
-
 pub trait ValueLookup: Sized {
-    fn get_key<'a, 'b>(&'a self, key: &'b str) -> anyhow::Result<&'a Self>;
-    fn get_int_key(&self, key: i64) -> anyhow::Result<&Self>;
+    fn get_key<'a>(&'a self, key: &'_ str) -> anyhow::Result<&'a Self>;
     fn get_index(&self, idx: usize) -> anyhow::Result<&Self>;
     fn get_bytes(&self) -> anyhow::Result<&[u8]>;
     fn get_array(&self) -> anyhow::Result<&[Self]>;
@@ -46,23 +36,12 @@ pub trait ValueLookup: Sized {
 }
 
 impl ValueLookup for Value {
-    fn get_key<'a, 'b>(&'a self, key: &'b str) -> anyhow::Result<&'a Value> {
+    fn get_key<'a>(&'a self, key: &'_ str) -> anyhow::Result<&'a Value> {
         self.as_map()
             .ok_or_else(|| anyhow!("Expected a map"))?
             .iter()
             .find_map(|(k, v)| match k {
                 Value::Text(s) if key == s => Some(v),
-                _ => None,
-            })
-            .ok_or(anyhow!("Missing key {key}"))
-    }
-
-    fn get_int_key(&self, key: i64) -> anyhow::Result<&Value> {
-        self.as_map()
-            .ok_or_else(|| anyhow!("Expected a map"))?
-            .iter()
-            .find_map(|(k, v)| match k {
-                Value::Integer(i) if &Integer::from(key) == i => Some(v),
                 _ => None,
             })
             .ok_or(anyhow!("Missing key {key}"))
@@ -111,16 +90,11 @@ fn issuer_signed_item(entry: &Value) -> Option<MdlField> {
     let bytes = entry.get_tag(24).ok()?.get_bytes().ok()?;
     let mut cbor = Vec::new();
     ciborium::into_writer(entry, &mut cbor).ok()?;
-    //let val: Value = from_reader(bytes).unwrap();
-    //println!("value {val:?}");
     let item: MdlItem = from_reader(bytes).ok()?;
-    //println!("item {item:?}");
     pod_value_for(&item.elementValue).map(|v| MdlField {
         key: item.elementIdentifier,
         value: v,
         cbor,
-        digest_id: item.digestID,
-        random: item.random,
     })
 }
 
@@ -138,8 +112,6 @@ pub fn prefix_for_key(key: &str) -> Vec<u8> {
 pub struct MdlField {
     pub key: String,
     pub value: TypedValue,
-    pub digest_id: u64,
-    pub random: Vec<u8>,
     pub cbor: Vec<u8>,
 }
 
@@ -150,7 +122,7 @@ pub struct MdlData {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-#[allow(non_snake_case)]
+#[allow(non_snake_case, dead_code)]
 struct MdlItem {
     digestID: u64,
     random: Vec<u8>,
@@ -159,11 +131,6 @@ struct MdlItem {
 }
 
 const NAMESPACE_STRINGS: &[&str] = &["org.iso.18013.5.1", "org.iso.18013.5.1.aamva"];
-
-fn base_from_bytes(bytes: &[u8]) -> P256Base {
-    let value_biguint = BigUint::from_bytes_be(bytes);
-    P256Base::from_noncanonical_biguint(value_biguint)
-}
 
 pub(super) fn scalar_from_bytes(bytes: &[u8]) -> P256Scalar {
     let scalar_biguint = BigUint::from_bytes_be(bytes);
@@ -429,7 +396,7 @@ pub(crate) mod test {
     use super::parse_data;
     use crate::mdlpod::parse::{DataType, EntryTarget, MdlData};
 
-    const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl_response.cbor");
+    const CBOR_DATA: &[u8] = include_bytes!("../../test_keys/mdl/response.cbor");
 
     pub fn cbor_parsed() -> anyhow::Result<MdlData> {
         parse_data(CBOR_DATA)
