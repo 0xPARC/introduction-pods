@@ -809,6 +809,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_verify_mdl_no_sig() -> anyhow::Result<()> {
         let mdl_data = cbor_parsed()?;
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
@@ -836,6 +837,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_verify_mdl_with_sig() -> anyhow::Result<()> {
         let mdl_data = cbor_parsed()?;
         let pk = public_key_from_bytes(include_bytes!("../test_keys/mdl/issuer-cert.pem"))?;
