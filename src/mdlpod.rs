@@ -64,8 +64,9 @@ use pod2::{
     },
     measure_gates_begin, measure_gates_end,
     middleware::{
-        self, AnchoredKey, DynError, F, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod, PodId,
-        RawValue, RecursivePod, SELF, Statement, ToFields, TypedValue, VALUE_SIZE, Value,
+        self, AnchoredKey, BackendError, F, Hash, KEY_TYPE, Key, NativePredicate, Params, Pod,
+        PodId, RawValue, RecursivePod, SELF, Statement, ToFields, TypedValue, VALUE_SIZE, VDSet,
+        Value,
     },
     timed,
 };
@@ -424,25 +425,25 @@ fn biguint_from_array(arr: [u64; 4]) -> BigUint {
     ])
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MdlPod {
     params: Params,
     id: PodId,
     pk: ECDSAPublicKey<P256>,
     mdl_dict: Vec<(String, Value)>,
     proof: Proof,
-    vds_root: Hash,
+    vd_set: VDSet,
 }
 
 #[derive(Clone, Debug)]
 struct MdlPodVerifyTarget {
-    vds_root: HashOutTarget,
+    vd_root: HashOutTarget,
     id: HashOutTarget,
     proof: ProofWithPublicInputsTarget<D>,
 }
 
 pub struct MdlPodVerifyInput {
-    vds_root: Hash,
+    vd_root: Hash,
     id: PodId,
     proof: ProofWithPublicInputs<F, C, D>,
 }
@@ -465,13 +466,13 @@ impl MdlPodVerifyTarget {
         .eval(builder, &statements);
 
         // register the public inputs
-        let vds_root = builder.add_virtual_hash();
+        let vd_root = builder.add_virtual_hash();
         builder.register_public_inputs(&id.elements);
-        builder.register_public_inputs(&vds_root.elements);
+        builder.register_public_inputs(&vd_root.elements);
 
         measure_gates_end!(builder, measure);
         Ok(MdlPodVerifyTarget {
-            vds_root,
+            vd_root,
             id,
             proof: proof_targ,
         })
@@ -480,7 +481,7 @@ impl MdlPodVerifyTarget {
     fn set_targets(&self, pw: &mut PartialWitness<F>, input: &MdlPodVerifyInput) -> Result<()> {
         pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
         pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
-        pw.set_target_arr(&self.vds_root.elements, &input.vds_root.0)?;
+        pw.set_target_arr(&self.vd_root.elements, &input.vd_root.0)?;
 
         Ok(())
     }
@@ -494,15 +495,15 @@ impl RecursivePod for MdlPod {
     fn proof(&self) -> Proof {
         self.proof.clone()
     }
-    fn vds_root(&self) -> Hash {
-        self.vds_root
+    fn vd_set(&self) -> &VDSet {
+        &self.vd_set
     }
     fn deserialize_data(
         params: Params,
         data: serde_json::Value,
-        vds_root: Hash,
+        vd_set: VDSet,
         id: PodId,
-    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
+    ) -> Result<Box<dyn RecursivePod>, BackendError> {
         let data: Data = serde_json::from_value(data)?;
         let common = get_common_data(&params)?;
         let proof = deserialize_proof(&common, &data.proof)?;
@@ -512,7 +513,7 @@ impl RecursivePod for MdlPod {
             mdl_dict: data.mdl_dict,
             pk: data.pk,
             proof,
-            vds_root,
+            vd_set,
         }))
     }
 }
@@ -537,7 +538,7 @@ fn build() -> Result<(MdlPodVerifyTarget, CircuitData<F, C, D>)> {
 impl MdlPod {
     fn _prove(
         params: &Params,
-        vds_root: Hash,
+        vd_set: &VDSet,
         pk: ECDSAPublicKey<P256>,
         mdl_data: &MdlData,
     ) -> Result<MdlPod> {
@@ -577,7 +578,7 @@ impl MdlPod {
 
         // set targets
         let input = MdlPodVerifyInput {
-            vds_root,
+            vd_root: vd_set.root(),
             id,
             proof: mdl_verify_proof,
         };
@@ -599,19 +600,19 @@ impl MdlPod {
             pk,
             mdl_dict,
             proof: proof_with_pis.proof,
-            vds_root,
+            vd_set: vd_set.clone(),
         })
     }
 
     #[allow(clippy::new_ret_no_self)]
     pub fn new(
         params: &Params,
-        vds_root: Hash,
+        vd_set: &VDSet,
         pk: ECDSAPublicKey<P256>,
         mdl_data: &[u8],
-    ) -> Result<Box<dyn RecursivePod>, Box<DynError>> {
+    ) -> Result<Box<dyn RecursivePod>, BackendError> {
         let mdl_data_parsed = parse_data(mdl_data)?;
-        Ok(Self::_prove(params, vds_root, pk, &mdl_data_parsed).map(Box::new)?)
+        Ok(Self::_prove(params, vd_set, pk, &mdl_data_parsed).map(Box::new)?)
     }
 
     fn _verify(&self) -> Result<()> {
@@ -629,7 +630,7 @@ impl MdlPod {
         let public_inputs = id
             .to_fields(&self.params)
             .iter()
-            .chain(self.vds_root().0.iter())
+            .chain(self.vd_set().root().0.iter())
             .cloned()
             .collect_vec();
 
@@ -646,8 +647,8 @@ impl Pod for MdlPod {
     fn params(&self) -> &Params {
         &self.params
     }
-    fn verify(&self) -> Result<(), Box<DynError>> {
-        Ok(self._verify().map_err(Box::new)?)
+    fn verify(&self) -> Result<(), BackendError> {
+        self._verify()
     }
 
     fn id(&self) -> PodId {
@@ -669,6 +670,18 @@ impl Pod for MdlPod {
             proof: serialize_proof(&self.proof),
         })
         .expect("serialization to json")
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self as &dyn std::any::Any
+    }
+
+    fn equals(&self, other: &dyn Pod) -> bool {
+        if let Some(o) = (other as &dyn std::any::Any).downcast_ref::<MdlPod>() {
+            self.equals(o)
+        } else {
+            false
+        }
     }
 }
 
@@ -789,7 +802,7 @@ pub mod tests {
         }))
     }
 
-    fn extract_pk_from_cert(cert_path: &str) -> Result<ECDSAPublicKey<P256>, Box<DynError>> {
+    fn extract_pk_from_cert(cert_path: &str) -> anyhow::Result<ECDSAPublicKey<P256>> {
         let pem_data = std::fs::read(cert_path)?;
         Ok(public_key_from_bytes(&pem_data)?)
     }
@@ -836,7 +849,7 @@ pub mod tests {
     }
 
     #[test]
-    fn test_mdl_pod() -> Result<(), Box<DynError>> {
+    fn test_mdl_pod() -> anyhow::Result<()> {
         // Load the MDL data
         let mdl_doc = include_bytes!("../test_keys/mdl/response.cbor");
 
@@ -860,10 +873,9 @@ pub mod tests {
                 .clone(),
             STANDARD_MDL_POD_DATA.1.verifier_only.clone(),
         ];
-        let vdset = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
-        let vds_root = vdset.root();
+        let vd_set = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
 
-        let mdl_pod = timed!("MdlPod::new", MdlPod::new(&params, vds_root, pk, mdl_doc)?);
+        let mdl_pod = timed!("MdlPod::new", MdlPod::new(&params, &vd_set, pk, mdl_doc)?);
 
         mdl_pod.verify()?;
 
