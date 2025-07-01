@@ -37,7 +37,7 @@ use plonky2_ecdsa::{
     gadgets::{
         biguint::WitnessBigUint,
         curve::CircuitBuilderCurve,
-        ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_message_circuit},
+        ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_secp256k1_message_circuit},
         nonnative::{CircuitBuilderNonNative, NonNativeTarget},
     },
 };
@@ -99,7 +99,7 @@ impl EcdsaVerifyTarget {
         let s = builder.add_virtual_nonnative_target();
         let sig = ECDSASignatureTarget::<Secp256K1> { r, s };
 
-        verify_message_circuit(builder, msg.clone(), sig.clone(), pk.clone());
+        verify_secp256k1_message_circuit(builder, msg.clone(), sig.clone(), pk.clone());
 
         // register public inputs
         for l in msg.value.limbs.iter() {
