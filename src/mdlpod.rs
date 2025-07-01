@@ -804,7 +804,7 @@ pub mod tests {
 
     fn extract_pk_from_cert(cert_path: &str) -> anyhow::Result<ECDSAPublicKey<P256>> {
         let pem_data = std::fs::read(cert_path)?;
-        Ok(public_key_from_bytes(&pem_data)?)
+        public_key_from_bytes(&pem_data)
     }
 
     #[test]

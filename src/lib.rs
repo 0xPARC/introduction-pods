@@ -40,9 +40,9 @@ pub mod tests {
     use plonky2::hash::hash_types::HashOut;
     use pod2::{
         self,
-        backends::plonky2::{mainpod, Result},
+        backends::plonky2::{Result, mainpod},
         frontend::MainPodBuilder,
-        middleware::{Params, Pod, RawValue, RecursivePod, VDSet, Value, F},
+        middleware::{F, Params, Pod, RawValue, RecursivePod, VDSet, Value},
         op, timed,
     };
 
