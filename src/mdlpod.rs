@@ -758,6 +758,7 @@ fn pub_self_statements(
 
 #[cfg(test)]
 pub mod tests {
+
     use p256::{PublicKey, elliptic_curve::sec1::ToEncodedPoint};
     use plonky2_ecdsa::{
         curve::{
@@ -848,8 +849,7 @@ pub mod tests {
         data.verify(proof)
     }
 
-    #[test]
-    fn test_mdl_pod() -> anyhow::Result<()> {
+    fn get_test_mdl_pod() -> anyhow::Result<(Box<dyn RecursivePod>, Params, VDSet)> {
         // Load the MDL data
         let mdl_doc = include_bytes!("../test_keys/mdl/response.cbor");
 
@@ -879,6 +879,21 @@ pub mod tests {
 
         mdl_pod.verify()?;
 
+        Ok((mdl_pod, params, vd_set))
+    }
+
+    #[test]
+    fn test_mdl_pod() -> anyhow::Result<()> {
+        get_test_mdl_pod().map(|_| ())
+    }
+
+    #[test]
+    #[ignore]
+    fn test_mdl_pod_serialization() -> anyhow::Result<()> {
+        let (pod, params, vd_set) = get_test_mdl_pod()?;
+        let data = pod.serialize_data();
+        let recovered_pod = MdlPod::deserialize_data(params, data, vd_set, pod.id())?;
+        assert!(pod.equals(recovered_pod.as_ref()));
         Ok(())
     }
 }
