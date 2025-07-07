@@ -12,6 +12,7 @@ base64 = "0.22.1"
 serde = "1.0.219"
 serde_json = "1.0.140"
 ssh-key = { version = "0.6.7", features = ["ed25519"] }
+sha2          = "0.10"
 
 # we use a specific commit to avoid breaking changes in the interfaces, updating
 # to latest pod2 version from time to time.
@@ -28,18 +29,13 @@ plonky2_u32 = { git = "https://github.com/ax0/plonky2-u32" }
 plonky2_rsa = { git = "https://github.com/dgulotta/plonky2-rsa.git", branch="fast" }
 
 # MdlPod specific dependencies:
-#serde_cbor    = "0.11"
-p256          = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
-#generic-array = "0.13"                  # for 32-byte arrays
-#pem           = "3"                     # tiny PEM helper
-sha2          = "0.10"
-#typenum       = "1"
 memchr = "2.7.5"
 ciborium = "0.2.2"
 
 [dev-dependencies]
 rand = "0.8.5"
 x509-parser   = "0.16"
+p256          = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
 
 [features]
 default = []

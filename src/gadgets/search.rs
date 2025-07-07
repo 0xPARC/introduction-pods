@@ -19,14 +19,13 @@ use plonky2::{
         target::{BoolTarget, Target},
         witness::{PartialWitness, WitnessWrite},
     },
-    plonk::{circuit_builder::CircuitBuilder, config::PoseidonGoldilocksConfig},
+    plonk::circuit_builder::CircuitBuilder,
 };
 
 use crate::gadgets::bits_bytes::set_bits_target_le;
 
 pub type F = GoldilocksField;
 pub const D: usize = 2;
-pub type C = PoseidonGoldilocksConfig;
 
 fn assert_len_ok(msg_len: usize, window_len: usize, n_merkle_leaves: usize) {
     assert!(msg_len >= window_len);
@@ -158,18 +157,6 @@ impl LookupTarget {
         }
     }
 
-    pub fn set_targets_from_substring(
-        &self,
-        pw: &mut PartialWitness<F>,
-        msg: &[u8],
-        substring: &[u8],
-        tree: &MerkleTree<F, PoseidonHash>,
-    ) -> anyhow::Result<()> {
-        let index = memchr::memmem::find(msg, substring)
-            .ok_or_else(|| anyhow::anyhow!("Substring not found"))?;
-        self.set_targets_from_index(pw, msg, index, tree)
-    }
-
     pub fn set_targets_from_index(
         &self,
         pw: &mut PartialWitness<F>,
@@ -185,12 +172,6 @@ impl LookupTarget {
             pw.set_hash_target(s_t, s)?;
         }
         set_bits_target_le(pw, &self.index_bits, index as u64)
-        /*
-        for (n, &t) in self.index_bits.iter().enumerate() {
-            pw.set_bool_target(t, (index >> n) & 1 != 0)?;
-        }
-        Ok(())
-        */
     }
 }
 
@@ -203,9 +184,10 @@ mod test {
     };
     use rand::{Rng, RngCore, rngs::OsRng};
 
-    use super::{C, LookupTarget, merkle_tree};
+    use super::{LookupTarget, merkle_tree};
     use crate::gadgets::search::merkle_root_rabin_karp_circuit;
 
+    type C = plonky2::plonk::config::PoseidonGoldilocksConfig;
     pub const MERKLE_TREE_DEPTH: usize = 12;
     pub const DOC_LENGTH: usize = 3072;
 
@@ -254,7 +236,7 @@ mod test {
             pw.set_hash_target(merkle_root_t, merkle_root)?;
             for l in lookups.iter() {
                 let idx = OsRng.gen_range(0..(DOC_LENGTH - window_len + 1));
-                l.set_targets_from_substring(&mut pw, &msg, &msg[idx..][..window_len], &tree)?;
+                l.set_targets_from_index(&mut pw, &msg, idx, &tree)?;
             }
             let data = builder.build::<C>();
             let proof = data.prove(pw)?;

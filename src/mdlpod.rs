@@ -30,7 +30,6 @@ use plonky2::{
         circuit_data::{CircuitConfig, CircuitData, VerifierOnlyCircuitData},
         proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget},
     },
-    util::log2_ceil,
 };
 use plonky2_ecdsa::{
     curve::{
@@ -113,7 +112,7 @@ struct MdlItemTarget {
     hash: VariableLengthSha256Targets,
 }
 
-// TODO: it turns out that the thing that is signed is not actually the mso,
+// TODO: it turns out that the thing that is signed is not exactly the mso,
 // but I haven't changed the variable names yet
 struct MdlDocTarget {
     mso: Vec<Target>,
@@ -134,7 +133,7 @@ fn connect_entry_and_hash(
         builder,
         entry.data_end_offset,
         max_allowed_end,
-        log2_ceil(hash.message.len()) - 3,
+        (hash.message.len().ilog2() - 2) as usize,
     );
 }
 
@@ -160,7 +159,7 @@ fn connect_mso_and_lookup(
     let digest_index = builder.le_sum(lookup.index_bits.iter());
     let window_len = builder.constant(F::from_canonical_u32(34));
     let digest_end = builder.add(digest_index, window_len);
-    check_less_or_equal(builder, digest_end, mso_len, SEARCH_TREE_DEPTH);
+    check_less_or_equal(builder, digest_end, mso_len, SEARCH_TREE_DEPTH + 1);
 }
 
 fn connect_doc_and_hash(
@@ -331,12 +330,6 @@ impl P256VerifyTarget {
 
         verify_p256_message_circuit(builder, msg.clone(), sig.clone(), pk.clone());
 
-        /*
-        // register public inputs
-        for l in msg.value.limbs.iter() {
-            builder.register_public_input(l.0);
-        }
-        */
         // register pk as public input
         for l in pk.0.x.value.limbs.iter() {
             builder.register_public_input(l.0);
@@ -678,7 +671,7 @@ impl Pod for MdlPod {
 
     fn equals(&self, other: &dyn Pod) -> bool {
         if let Some(o) = (other as &dyn std::any::Any).downcast_ref::<MdlPod>() {
-            self.equals(o)
+            self == o
         } else {
             false
         }
@@ -809,7 +802,6 @@ pub mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_verify_mdl_no_sig() -> anyhow::Result<()> {
         let mdl_data = cbor_parsed()?;
         let mut builder = CircuitBuilder::new(CircuitConfig::standard_recursion_config());
@@ -885,6 +877,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_mdl_pod() -> anyhow::Result<()> {
         get_test_mdl_pod().map(|_| ())
     }

@@ -158,7 +158,6 @@ pub fn parse_data(data: &[u8]) -> anyhow::Result<MdlData> {
         .get_index(0)?
         .get_key("issuerSigned")?;
     let issuer_auth = issuer_signed.get_key("issuerAuth")?;
-    //let mso = issuer_auth.get_index(2)?.get_bytes()?.to_vec();
     let signature_bytes = issuer_auth.get_index(3)?.get_bytes()?.to_vec();
     let namespaces = issuer_signed.get_key("nameSpaces")?;
     let mut entries: BTreeMap<String, MdlField> = BTreeMap::new();

@@ -52,7 +52,7 @@ use ssh_key::{
     public::{KeyData, RsaPublicKey},
 };
 
-use crate::{PodType, utils::le_bits_to_bytes_targets};
+use crate::{PodType, gadgets::bits_bytes::reversed_bits_to_bytes_be};
 
 const RSA_BYTE_SIZE: usize = 512;
 
@@ -180,9 +180,9 @@ impl RsaPodVerifyTarget {
 
         // Form statements
         let msg_bits = biguint_to_bits_targets(builder, &msg, 8 * RSA_BYTE_SIZE);
-        let msg_bytes = le_bits_to_bytes_targets(builder, &msg_bits);
+        let msg_bytes = reversed_bits_to_bytes_be(builder, &msg_bits);
         let modulus_bits = biguint_to_bits_targets(builder, &modulus, 8 * RSA_BYTE_SIZE);
-        let modulus_bytes = le_bits_to_bytes_targets(builder, &modulus_bits);
+        let modulus_bytes = reversed_bits_to_bytes_be(builder, &modulus_bits);
 
         let statements = pub_self_statements_target(builder, params, &msg_bytes, &modulus_bytes);
         let id = CalculateIdGadget {

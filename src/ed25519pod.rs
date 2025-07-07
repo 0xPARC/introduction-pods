@@ -52,7 +52,7 @@ use pod2::{
 use serde::{Deserialize, Serialize};
 use ssh_key::{SshSig, public::KeyData};
 
-use crate::{PodType, utils::le_bits_to_bytes_targets};
+use crate::{PodType, gadgets::bits_bytes::reversed_bits_to_bytes_be};
 
 const KEY_SIGNED_MSG: &str = "signed_msg";
 const KEY_ED25519_PK: &str = "ed25519_pk";
@@ -103,7 +103,7 @@ impl Ed25519PodVerifyTarget {
         let pk_bits = &proof_targ.public_inputs[SIGNED_DATA_LEN * 8..SIGNED_DATA_LEN * 8 + 256];
 
         // Convert bits to bytes for hashing (group by 8 bits)
-        let msg_targets = le_bits_to_bytes_targets(
+        let msg_targets = reversed_bits_to_bytes_be(
             builder,
             &msg_bits
                 .iter()
@@ -111,7 +111,7 @@ impl Ed25519PodVerifyTarget {
                 .map(|b| BoolTarget::new_unsafe(*b)) // assuming that msg_bits contains only {0, 1}
                 .collect::<Vec<_>>(),
         );
-        let pk_targets = le_bits_to_bytes_targets(
+        let pk_targets = reversed_bits_to_bytes_be(
             builder,
             &pk_bits
                 .iter()

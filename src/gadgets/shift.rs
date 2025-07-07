@@ -50,21 +50,18 @@ mod test {
         for (&ch, &ch_t) in msg.iter().zip(msg_t.iter()) {
             pw.set_target(ch_t, GoldilocksField::from_canonical_u8(ch))?;
         }
-        for _ in 0..1 {
-            let idx = OsRng.gen_range(0..4096);
-            let idx_bits_t: [_; 12] =
-                core::array::from_fn(|_| builder.add_virtual_bool_target_safe());
-            for (n, &b) in idx_bits_t.iter().enumerate() {
-                pw.set_bool_target(b, (idx >> n) & 1 != 0)?;
-            }
-            let window_t = builder.add_virtual_targets(WINDOW_LEN);
-            for (&ch, &ch_t) in msg.iter().skip(idx).zip(window_t.iter()) {
-                pw.set_target(ch_t, GoldilocksField::from_canonical_u8(ch))?;
-            }
-            let shifted_t = shift_left(&mut builder, &msg_t, &idx_bits_t);
-            for (&t1, &t2) in window_t.iter().zip(shifted_t.iter()) {
-                builder.connect(t1, t2);
-            }
+        let idx = OsRng.gen_range(0..4096);
+        let idx_bits_t: [_; 12] = core::array::from_fn(|_| builder.add_virtual_bool_target_safe());
+        for (n, &b) in idx_bits_t.iter().enumerate() {
+            pw.set_bool_target(b, (idx >> n) & 1 != 0)?;
+        }
+        let window_t = builder.add_virtual_targets(WINDOW_LEN);
+        for (&ch, &ch_t) in msg.iter().skip(idx).zip(window_t.iter()) {
+            pw.set_target(ch_t, GoldilocksField::from_canonical_u8(ch))?;
+        }
+        let shifted_t = shift_left(&mut builder, &msg_t, &idx_bits_t);
+        for (&t1, &t2) in window_t.iter().zip(shifted_t.iter()) {
+            builder.connect(t1, t2);
         }
         let data = builder.build::<C>();
         let proof = data.prove(pw)?;

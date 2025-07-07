@@ -8,24 +8,32 @@ use plonky2::{
     plonk::circuit_builder::CircuitBuilder,
 };
 
-pub fn bytes_to_bits_be<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    bytes: &[Target],
-) -> Vec<BoolTarget> {
-    bytes
-        .iter()
-        .flat_map(|&byte| builder.split_le(byte, 8).into_iter().rev())
-        .collect()
-}
-
 pub fn bits_to_bytes_be<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     bits: &[BoolTarget],
 ) -> Vec<Target> {
-    assert!(bits.len() % 8 == 0);
+    assert_eq!(bits.len() % 8, 0);
     bits.chunks(8)
-        .map(|window| builder.le_sum(window.iter().rev()))
+        .map(|chunk| builder.le_sum(chunk.iter().rev()))
         .collect()
+}
+
+// Helper function to convert bit targets to byte targets
+pub fn reversed_bits_to_bytes_be<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    bits: &[BoolTarget],
+) -> Vec<Target> {
+    assert_eq!(bits.len() % 8, 0);
+    let mut bytes = Vec::new();
+
+    for chunk in bits.chunks(8) {
+        let byte_val = builder.le_sum(chunk.iter());
+
+        bytes.push(byte_val);
+    }
+
+    bytes.reverse();
+    bytes
 }
 
 pub fn set_bits_target_le<F: Field>(
