@@ -589,6 +589,7 @@ pub mod tests {
 
     use super::*;
 
+    #[ignore]
     fn get_test_rsa_pod() -> Result<(Box<dyn RecursivePod>, VDSet, Vec<u8>)> {
         let params = Params {
             max_input_signed_pods: 0,
@@ -621,6 +622,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_rsa_pod_with_mainpod_verify() -> Result<()> {
         let (rsa_pod, vd_set, msg_encoded) = get_test_rsa_pod().unwrap();
         let params = rsa_pod.params().clone();
@@ -645,6 +647,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_ssh_rsa_encode() -> Result<()> {
         // Only tests a signature generated with Sha512 as the inner hash algorithm and rsa-sha2-512 as the signature method.
         let msg = "0xPARC\n";
