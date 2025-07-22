@@ -45,7 +45,7 @@ use plonky2_ecdsa::{
 use plonky2_sha256::circuit::{
     VariableLengthSha256Targets, fill_variable_length_circuits, make_variable_length_circuits,
 };
-use plonky2_u32::gadgets::arithmetic_ux::UXTarget;
+use plonky2_ux::gadgets::arithmetic_ux::UXTarget;
 use pod2::{
     backends::plonky2::{
         Error, Result,
@@ -117,7 +117,7 @@ struct MdlItemTarget {
 pub struct MdlDocTarget {
     pub mso: Vec<Target>,
     pub mso_len: Target,
-    pub entries: Vec<MdlItemTarget>,
+    entries: Vec<MdlItemTarget>,
 }
 
 fn connect_entry_and_hash(
@@ -314,9 +314,10 @@ impl P256VerifyTarget {
             }
             limbs.push(limb);
         }   
+        let ux_target_limbs: Vec<UXTarget<BITS>> = limbs.into_iter().map(|limb| UXTarget::<BITS>(limb)).collect();
         // Create BigUintTarget from u29 limbs
         let msg_big_uint = BigUintTarget {
-            limbs: limbs.into_iter().map(|limb| UXTarget::<BITS>(limb)).collect(),
+            limbs: ux_target_limbs
         };
 
         // Create NonNativeTarget from limbs
