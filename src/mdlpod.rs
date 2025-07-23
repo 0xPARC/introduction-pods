@@ -9,10 +9,10 @@
 
 pub mod parse;
 use std::sync::LazyLock;
-use num::integer::div_ceil;
+
 use anyhow::anyhow;
 use itertools::Itertools;
-use num::bigint::BigUint;
+use num::{bigint::BigUint, integer::div_ceil};
 use plonky2::{
     field::types::Field,
     hash::{
@@ -39,7 +39,7 @@ use plonky2_ecdsa::{
         biguint::{BigUintTarget, WitnessBigUint, convert_base},
         curve::CircuitBuilderCurve,
         ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_p256_message_circuit},
-        nonnative::{CircuitBuilderNonNative, BITS},
+        nonnative::{BITS, CircuitBuilderNonNative},
     },
 };
 use plonky2_sha256::circuit::{
@@ -80,7 +80,6 @@ use crate::{
     },
     mdlpod::parse::{DataType, EntryTarget, MdlData, parse_data, sha_256_pad},
 };
-
 
 pub type MDLFieldData<'a> = &'a [(&'a str, DataType)];
 
@@ -289,10 +288,7 @@ impl P256VerifyTarget {
 
         // Convert the 256-bit digest output to bytes
         let digest_bits_targets: Vec<Target> = (0..256)
-            .map(|i| {
-                let bit_val = builder.select(sha256_targets.digest[i], one, zero);
-                bit_val
-            })
+            .map(|i| builder.select(sha256_targets.digest[i], one, zero))
             .collect();
         // Convert bits to u29 limbs (9 limbs, 29 bits each)
         let mut limbs = Vec::new();
@@ -302,22 +298,23 @@ impl P256VerifyTarget {
             let mut limb = builder.zero();
             for bit_idx in 0..BITS {
                 //for the last one we have less than 29 bits
-                if digest_len <= limb_idx * BITS + bit_idx{
+                if digest_len <= limb_idx * BITS + bit_idx {
                     break;
                 }
                 // Take bits from the end first (big-endian)
                 let bit_index = digest_len - 1 - (limb_idx * BITS + bit_idx);
                 let bit_target = digest_bits_targets[bit_index];
-                let shift = builder.constant(F::from_canonical_u64(1u64<<bit_idx));
+                let shift = builder.constant(F::from_canonical_u64(1u64 << bit_idx));
                 let shifted = builder.mul(bit_target, shift);
                 limb = builder.add(limb, shifted);
             }
             limbs.push(limb);
-        }   
-        let ux_target_limbs: Vec<UXTarget<BITS>> = limbs.into_iter().map(|limb| UXTarget::<BITS>(limb)).collect();
+        }
+        let ux_target_limbs: Vec<UXTarget<BITS>> =
+            limbs.into_iter().map(UXTarget::<BITS>).collect();
         // Create BigUintTarget from u29 limbs
         let msg_big_uint = BigUintTarget {
-            limbs: ux_target_limbs
+            limbs: ux_target_limbs,
         };
 
         // Create NonNativeTarget from limbs
@@ -695,7 +692,8 @@ fn pub_self_statements_target(
     };
     let ak = ak_for(builder, "pk_hash");
     let num_limbs = div_ceil(256, BITS);
-    let hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(public_inputs[..2 * num_limbs].to_vec());
+    let hash =
+        builder.hash_n_to_hash_no_pad::<PoseidonHash>(public_inputs[..2 * num_limbs].to_vec());
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&hash.elements));
     let st = StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak, value]);
     statements.push(st);
@@ -713,20 +711,28 @@ fn pub_self_statements_target(
 }
 
 fn pk_statement(pk: &ECDSAPublicKey<P256>) -> middleware::Statement {
-    let base_32_x : Vec<_> = pk.0.x
+    let base_32_x: Vec<_> =
+        pk.0.x
             .0
             .into_iter()
             .flat_map(|x| [x as u32, (x >> 32) as u32])
             .collect();
-    let base_32_y : Vec<_> = pk.0.y.0.into_iter()
+    let base_32_y: Vec<_> =
+        pk.0.y
+            .0
+            .into_iter()
             .flat_map(|x| [x as u32, (x >> 32) as u32])
             .collect();
-    
+
     let base_29_x = convert_base(&base_32_x, 32, BITS);
     let base_29_y = convert_base(&base_32_y, 32, BITS);
 
-    let data_array: Vec<_> = base_29_x.into_iter().chain(base_29_y).map(F::from_canonical_u32).collect();
-        
+    let data_array: Vec<_> = base_29_x
+        .into_iter()
+        .chain(base_29_y)
+        .map(F::from_canonical_u32)
+        .collect();
+
     let value = Value::from(TypedValue::Raw(RawValue(
         hash_n_to_hash_no_pad::<_, PoseidonPermutation<_>>(&data_array).elements,
     )));

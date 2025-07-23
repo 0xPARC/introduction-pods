@@ -11,10 +11,7 @@
 use std::{any::Any, sync::LazyLock};
 
 use itertools::Itertools;
-use num::{
-    integer::div_ceil,
-    bigint::BigUint
-};
+use num::{bigint::BigUint, integer::div_ceil};
 use plonky2::{
     field::{secp256k1_scalar::Secp256K1Scalar, types::Field},
     hash::{
@@ -41,7 +38,7 @@ use plonky2_ecdsa::{
         biguint::{WitnessBigUint, convert_base},
         curve::CircuitBuilderCurve,
         ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_secp256k1_message_circuit},
-        nonnative::{CircuitBuilderNonNative, NonNativeTarget, BITS},
+        nonnative::{BITS, CircuitBuilderNonNative, NonNativeTarget},
     },
 };
 use pod2::{
@@ -559,7 +556,6 @@ pub mod tests {
 
         Ok(())
     }
-
 
     fn get_test_ecdsa_pod() -> Result<(Box<dyn RecursivePod>, Params, VDSet, Secp256K1Scalar)> {
         let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
