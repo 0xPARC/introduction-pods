@@ -371,7 +371,6 @@ pub struct MdlVerifyTarget {
 impl MdlVerifyTarget {
     fn add_targets(builder: &mut CircuitBuilder<F, D>) -> Self {
         let sig = P256VerifyTarget::add_targets(builder, MSO_MAX_BITS_PADDED);
-        builder.print_gate_counts(0);
         let doc = MdlDocTarget::add_targets(builder, MDL_FIELDS);
         connect_doc_and_hash(builder, &doc, &sig.sha256_targets);
         Self { doc, sig }
@@ -886,12 +885,12 @@ pub mod tests {
         get_test_mdl_pod().map(|_| ())
     }
 
-    // #[test]
-    // fn test_mdl_pod_serialization() -> anyhow::Result<()> {
-    //     let (pod, params, vd_set) = get_test_mdl_pod()?;
-    //     let data = pod.serialize_data();
-    //     let recovered_pod = MdlPod::deserialize_data(params, data, vd_set, pod.id())?;
-    //     assert!(pod.equals(recovered_pod.as_ref()));
-    //     Ok(())
-    // }
+    #[test]
+    fn test_mdl_pod_serialization() -> anyhow::Result<()> {
+        let (pod, params, vd_set) = get_test_mdl_pod()?;
+        let data = pod.serialize_data();
+        let recovered_pod = MdlPod::deserialize_data(params, data, vd_set, pod.id())?;
+        assert!(pod.equals(recovered_pod.as_ref()));
+        Ok(())
+    }
 }

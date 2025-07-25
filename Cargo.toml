@@ -31,10 +31,6 @@ plonky2_rsa = { git = "https://github.com/dgulotta/plonky2-rsa.git", branch="fas
 # MdlPod specific dependencies:
 memchr = "2.7.5"
 ciborium = "0.2.2"
-x509-parser = "0.16"
-p256 = "0.13.2"
-log = "0.4.14"
-env_logger = "0.10.0"
 
 [dev-dependencies]
 rand = "0.8.5"
