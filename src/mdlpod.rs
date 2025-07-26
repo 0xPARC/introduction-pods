@@ -318,7 +318,7 @@ impl P256VerifyTarget {
         };
 
         // Create NonNativeTarget from limbs
-        let msg = builder.biguint_to_nonnative(&msg_big_uint);
+        let msg = builder.biguint_to_nonnative(&msg_big_uint, false);
         let pk = ECDSAPublicKeyTarget(builder.add_virtual_affine_point_target::<P256>());
         let r = builder.add_virtual_nonnative_target();
         let s = builder.add_virtual_nonnative_target();
