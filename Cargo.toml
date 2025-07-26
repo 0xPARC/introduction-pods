@@ -19,8 +19,7 @@ sha2          = "0.10"
 pod2 = { git="https://github.com/0xPARC/pod2", rev="115c3c11524a0426a1b74db26ea0c78bf90bddb8" }
 
 # EcdsaPod specific dependencies:
-# plonky2_ecdsa = {git = "https://github.com/Weobe/plonky2-ecdsa.git"}
-plonky2_ecdsa = {path = "../plonky2-ecdsa"}
+plonky2_ecdsa = {git = "https://github.com/Weobe/plonky2-ecdsa.git"}
 num = { version = "0.4.0", default-features = false }
 plonky2_ed25519 = {git = "https://github.com/Weobe/plonky2-ed25519"}
 plonky2_sha256 = {git = "https://github.com/Weobe/plonky2-sha256.git"}
