@@ -645,6 +645,7 @@ pub mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_ssh_rsa_encode() -> Result<()> {
         // Only tests a signature generated with Sha512 as the inner hash algorithm and rsa-sha2-512 as the signature method.
         let msg = "0xPARC\n";

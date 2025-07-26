@@ -7,13 +7,12 @@
 //!   `standard_recursion_config`, padded to match the `RecursiveCircuit<MainPod>`
 //!   configuration.
 
-mod parse;
-
+pub mod parse;
 use std::sync::LazyLock;
 
 use anyhow::anyhow;
 use itertools::Itertools;
-use num::bigint::BigUint;
+use num::{bigint::BigUint, integer::div_ceil};
 use plonky2::{
     field::types::Field,
     hash::{
@@ -37,16 +36,16 @@ use plonky2_ecdsa::{
         p256::P256,
     },
     gadgets::{
-        biguint::{BigUintTarget, WitnessBigUint},
+        biguint::{BigUintTarget, WitnessBigUint, convert_base},
         curve::CircuitBuilderCurve,
         ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_p256_message_circuit},
-        nonnative::CircuitBuilderNonNative,
+        nonnative::{BITS, CircuitBuilderNonNative},
     },
 };
 use plonky2_sha256::circuit::{
     VariableLengthSha256Targets, fill_variable_length_circuits, make_variable_length_circuits,
 };
-use plonky2_u32::gadgets::arithmetic_u32::U32Target;
+use plonky2_ux::gadgets::arithmetic_ux::UXTarget;
 use pod2::{
     backends::plonky2::{
         Error, Result,
@@ -82,7 +81,7 @@ use crate::{
     mdlpod::parse::{DataType, EntryTarget, MdlData, parse_data, sha_256_pad},
 };
 
-type MDLFieldData<'a> = &'a [(&'a str, DataType)];
+pub type MDLFieldData<'a> = &'a [(&'a str, DataType)];
 
 const MDL_FIELDS: MDLFieldData<'static> = &[
     ("document_number", DataType::String),
@@ -114,9 +113,9 @@ struct MdlItemTarget {
 
 // TODO: it turns out that the thing that is signed is not exactly the mso,
 // but I haven't changed the variable names yet
-struct MdlDocTarget {
-    mso: Vec<Target>,
-    mso_len: Target,
+pub struct MdlDocTarget {
+    pub mso: Vec<Target>,
+    pub mso_len: Target,
     entries: Vec<MdlItemTarget>,
 }
 
@@ -186,7 +185,7 @@ const MSO_MAX_BITS_PADDED: usize = MSO_MAX_BYTES_PADDED * 8;
 const MSO_MAX_BYTES_UNPADDED: usize = MSO_MAX_BYTES_PADDED - 9;
 
 impl MdlDocTarget {
-    fn add_targets(builder: &mut CircuitBuilder<F, D>, fields: MDLFieldData<'_>) -> Self {
+    pub fn add_targets(builder: &mut CircuitBuilder<F, D>, fields: MDLFieldData<'_>) -> Self {
         let measure = measure_gates_begin!(builder, "MdlDocTarget");
         let mso_len = builder.add_virtual_target();
         let mso = builder.add_virtual_targets(MSO_MAX_BYTES_UNPADDED);
@@ -216,7 +215,7 @@ impl MdlDocTarget {
         }
     }
 
-    fn set_targets(&self, pw: &mut PartialWitness<F>, data: &MdlData) -> anyhow::Result<()> {
+    pub fn set_targets(&self, pw: &mut PartialWitness<F>, data: &MdlData) -> anyhow::Result<()> {
         let mut mso_padded = data.signed_message.clone();
         sha_256_pad(&mut mso_padded, MSO_MAX_BLOCKS)?;
         for (&ch_t, &ch) in self.mso.iter().zip(mso_padded.iter()) {
@@ -288,46 +287,42 @@ impl P256VerifyTarget {
         let one = builder.one();
 
         // Convert the 256-bit digest output to bytes
-        let digest_bytes_targets: Vec<Target> = (0..32)
-            .map(|i| {
-                // Convert 8 bits to a byte
-                let mut byte_val = zero;
-                for j in 0..8 {
-                    let bit_val = builder.select(sha256_targets.digest[i * 8 + j], one, zero);
-                    let shift = builder.constant(F::from_canonical_u32(1 << (7 - j)));
-                    let shifted = builder.mul(bit_val, shift);
-                    byte_val = builder.add(byte_val, shifted);
-                }
-                byte_val
-            })
+        let digest_bits_targets: Vec<Target> = (0..256)
+            .map(|i| builder.select(sha256_targets.digest[i], one, zero))
             .collect();
-        // Convert bytes to u32 limbs (8 limbs, 4 bytes each)
+        // Convert bits to u29 limbs (9 limbs, 29 bits each)
         let mut limbs = Vec::new();
-        for limb_idx in 0..8 {
+        let digest_len = digest_bits_targets.len();
+        let num_limbs = div_ceil(digest_len, BITS);
+        for limb_idx in 0..num_limbs {
             let mut limb = builder.zero();
-            for byte_idx in 0..4 {
-                // Take bytes from the end first (big-endian)
-                let byte_index = 31 - (limb_idx * 4 + byte_idx);
-                let byte_target = digest_bytes_targets[byte_index];
-                let shift = builder.constant(F::from_canonical_u64(1u64 << (8 * byte_idx)));
-                let shifted = builder.mul(byte_target, shift);
+            for bit_idx in 0..BITS {
+                //for the last one we have less than 29 bits
+                if digest_len <= limb_idx * BITS + bit_idx {
+                    break;
+                }
+                // Take bits from the end first (big-endian)
+                let bit_index = digest_len - 1 - (limb_idx * BITS + bit_idx);
+                let bit_target = digest_bits_targets[bit_index];
+                let shift = builder.constant(F::from_canonical_u64(1u64 << bit_idx));
+                let shifted = builder.mul(bit_target, shift);
                 limb = builder.add(limb, shifted);
             }
             limbs.push(limb);
         }
-
-        // Create BigUintTarget from u32 limbs
+        let ux_target_limbs: Vec<UXTarget<BITS>> =
+            limbs.into_iter().map(UXTarget::<BITS>).collect();
+        // Create BigUintTarget from u29 limbs
         let msg_big_uint = BigUintTarget {
-            limbs: limbs.into_iter().map(U32Target).collect(),
+            limbs: ux_target_limbs,
         };
 
         // Create NonNativeTarget from limbs
-        let msg = builder.biguint_to_nonnative(&msg_big_uint);
+        let msg = builder.biguint_to_nonnative(&msg_big_uint, false);
         let pk = ECDSAPublicKeyTarget(builder.add_virtual_affine_point_target::<P256>());
         let r = builder.add_virtual_nonnative_target();
         let s = builder.add_virtual_nonnative_target();
         let sig = ECDSASignatureTarget::<P256> { r, s };
-
         verify_p256_message_circuit(builder, msg.clone(), sig.clone(), pk.clone());
 
         // register pk as public input
@@ -381,7 +376,7 @@ impl MdlVerifyTarget {
         Self { doc, sig }
     }
 
-    fn set_targets(
+    pub fn set_targets(
         &self,
         pw: &mut PartialWitness<F>,
         pk: &ECDSAPublicKey<P256>,
@@ -394,7 +389,7 @@ impl MdlVerifyTarget {
     }
 }
 
-static MDL_VERIFY_DATA: LazyLock<(MdlVerifyTarget, CircuitData<F, C, D>)> =
+pub static MDL_VERIFY_DATA: LazyLock<(MdlVerifyTarget, CircuitData<F, C, D>)> =
     LazyLock::new(build_mdl_verify);
 
 fn build_mdl_verify() -> (MdlVerifyTarget, CircuitData<F, C, D>) {
@@ -429,7 +424,7 @@ pub struct MdlPod {
 }
 
 #[derive(Clone, Debug)]
-struct MdlPodVerifyTarget {
+pub struct MdlPodVerifyTarget {
     vd_root: HashOutTarget,
     id: HashOutTarget,
     proof: ProofWithPublicInputsTarget<D>,
@@ -450,19 +445,16 @@ impl MdlPodVerifyTarget {
         let verifier_data_targ = builder.constant_verifier_data(&circuit_data.verifier_only);
         let proof_targ = builder.add_virtual_proof_with_pis(&circuit_data.common);
         builder.verify_proof::<C>(&proof_targ, &verifier_data_targ, &circuit_data.common);
-
         // calculate id
         let statements = pub_self_statements_target(builder, params, &proof_targ.public_inputs);
         let id = CalculateIdGadget {
             params: params.clone(),
         }
         .eval(builder, &statements);
-
         // register the public inputs
         let vd_root = builder.add_virtual_hash();
         builder.register_public_inputs(&id.elements);
         builder.register_public_inputs(&vd_root.elements);
-
         measure_gates_end!(builder, measure);
         Ok(MdlPodVerifyTarget {
             vd_root,
@@ -471,11 +463,10 @@ impl MdlPodVerifyTarget {
         })
     }
 
-    fn set_targets(&self, pw: &mut PartialWitness<F>, input: &MdlPodVerifyInput) -> Result<()> {
+    pub fn set_targets(&self, pw: &mut PartialWitness<F>, input: &MdlPodVerifyInput) -> Result<()> {
         pw.set_proof_with_pis_target(&self.proof, &input.proof)?;
         pw.set_hash_target(self.id, HashOut::from_vec(input.id.0.0.to_vec()))?;
         pw.set_target_arr(&self.vd_root.elements, &input.vd_root.0)?;
-
         Ok(())
     }
 }
@@ -511,10 +502,10 @@ impl RecursivePod for MdlPod {
     }
 }
 
-static STANDARD_MDL_POD_DATA: LazyLock<(MdlPodVerifyTarget, CircuitData<F, C, D>)> =
+pub static STANDARD_MDL_POD_DATA: LazyLock<(MdlPodVerifyTarget, CircuitData<F, C, D>)> =
     LazyLock::new(|| build().expect("successful build"));
 
-fn build() -> Result<(MdlPodVerifyTarget, CircuitData<F, C, D>)> {
+pub fn build() -> Result<(MdlPodVerifyTarget, CircuitData<F, C, D>)> {
     let params = &*pod2::backends::plonky2::DEFAULT_PARAMS;
     let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
     let config = rec_circuit_data.common.config.clone();
@@ -522,7 +513,6 @@ fn build() -> Result<(MdlPodVerifyTarget, CircuitData<F, C, D>)> {
     let mdl_pod_verify_target = MdlPodVerifyTarget::add_targets(&mut builder, params)?;
     let rec_circuit_data = &*pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA;
     pod2::backends::plonky2::recursion::pad_circuit(&mut builder, &rec_circuit_data.common);
-
     let data = timed!("MdlPod build", builder.build::<C>());
     assert_eq!(rec_circuit_data.common, data.common);
     Ok((mdl_pod_verify_target, data))
@@ -586,7 +576,6 @@ impl MdlPod {
         circuit_data
             .verifier_data()
             .verify(proof_with_pis.clone())?;
-
         Ok(MdlPod {
             params: params.clone(),
             id,
@@ -626,7 +615,6 @@ impl MdlPod {
             .chain(self.vd_set().root().0.iter())
             .cloned()
             .collect_vec();
-
         circuit_data
             .verify(ProofWithPublicInputs {
                 proof: self.proof.clone(),
@@ -702,11 +690,13 @@ fn pub_self_statements_target(
         StatementArgTarget::anchored_key(b, &self_id, &key)
     };
     let ak = ak_for(builder, "pk_hash");
-    let hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(public_inputs[..16].to_vec());
+    let num_limbs = div_ceil(256, BITS);
+    let hash =
+        builder.hash_n_to_hash_no_pad::<PoseidonHash>(public_inputs[..2 * num_limbs].to_vec());
     let value = StatementArgTarget::literal(builder, &ValueTarget::from_slice(&hash.elements));
     let st = StatementTarget::new_native(builder, params, NativePredicate::Equal, &[ak, value]);
     statements.push(st);
-    for (chunk, (name, _)) in public_inputs[16..]
+    for (chunk, (name, _)) in public_inputs[num_limbs * 2..]
         .chunks(VALUE_SIZE)
         .zip_eq(MDL_FIELDS.iter())
     {
@@ -720,13 +710,28 @@ fn pub_self_statements_target(
 }
 
 fn pk_statement(pk: &ECDSAPublicKey<P256>) -> middleware::Statement {
-    let data_array: Vec<_> =
+    let base_32_x: Vec<_> =
         pk.0.x
             .0
             .into_iter()
-            .chain(pk.0.y.0)
-            .flat_map(|x| [x as u32, (x >> 32) as u32].map(F::from_canonical_u32))
+            .flat_map(|x| [x as u32, (x >> 32) as u32])
             .collect();
+    let base_32_y: Vec<_> =
+        pk.0.y
+            .0
+            .into_iter()
+            .flat_map(|x| [x as u32, (x >> 32) as u32])
+            .collect();
+
+    let base_29_x = convert_base(&base_32_x, 32, BITS);
+    let base_29_y = convert_base(&base_32_y, 32, BITS);
+
+    let data_array: Vec<_> = base_29_x
+        .into_iter()
+        .chain(base_29_y)
+        .map(F::from_canonical_u32)
+        .collect();
+
     let value = Value::from(TypedValue::Raw(RawValue(
         hash_n_to_hash_no_pad::<_, PoseidonPermutation<_>>(&data_array).elements,
     )));
@@ -829,7 +834,6 @@ pub mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_verify_mdl_with_sig() -> anyhow::Result<()> {
         let mdl_data = cbor_parsed()?;
         let pk = public_key_from_bytes(include_bytes!("../test_keys/mdl/issuer-cert.pem"))?;
@@ -877,13 +881,11 @@ pub mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_mdl_pod() -> anyhow::Result<()> {
         get_test_mdl_pod().map(|_| ())
     }
 
     #[test]
-    #[ignore]
     fn test_mdl_pod_serialization() -> anyhow::Result<()> {
         let (pod, params, vd_set) = get_test_mdl_pod()?;
         let data = pod.serialize_data();

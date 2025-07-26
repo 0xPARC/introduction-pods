@@ -11,7 +11,7 @@
 use std::{any::Any, sync::LazyLock};
 
 use itertools::Itertools;
-use num::bigint::BigUint;
+use num::{bigint::BigUint, integer::div_ceil};
 use plonky2::{
     field::{secp256k1_scalar::Secp256K1Scalar, types::Field},
     hash::{
@@ -35,10 +35,10 @@ use plonky2_ecdsa::{
         secp256k1::Secp256K1,
     },
     gadgets::{
-        biguint::WitnessBigUint,
+        biguint::{WitnessBigUint, convert_base},
         curve::CircuitBuilderCurve,
         ecdsa::{ECDSAPublicKeyTarget, ECDSASignatureTarget, verify_secp256k1_message_circuit},
-        nonnative::{CircuitBuilderNonNative, NonNativeTarget},
+        nonnative::{BITS, CircuitBuilderNonNative, NonNativeTarget},
     },
 };
 use pod2::{
@@ -136,7 +136,6 @@ impl EcdsaVerifyTarget {
         pw.set_biguint_target(&self.pk.0.y.value, &biguint_from_array(pk.0.y.0))?;
         pw.set_biguint_target(&self.signature.r.value, &biguint_from_array(signature.r.0))?;
         pw.set_biguint_target(&self.signature.s.value, &biguint_from_array(signature.s.0))?;
-
         Ok(())
     }
 }
@@ -165,8 +164,10 @@ impl EcdsaPodVerifyTarget {
         builder.verify_proof::<C>(&proof_targ, &verifier_data_targ, &circuit_data.common);
 
         // calculate id
-        let msg = &proof_targ.public_inputs[0..8];
-        let pk = &proof_targ.public_inputs[8..24];
+        // how do we know these numbers are correct??
+        let num_limbs = div_ceil(256, BITS);
+        let msg = &proof_targ.public_inputs[0..num_limbs];
+        let pk = &proof_targ.public_inputs[num_limbs..3 * num_limbs];
         let statements = pub_self_statements_target(builder, params, msg, pk);
         let id = CalculateIdGadget {
             params: params.clone(),
@@ -341,27 +342,22 @@ impl EcdsaPod {
         let (ecdsa_verify_target, ecdsa_circuit_data) = &*ECDSA_VERIFY_DATA;
         let mut pw = PartialWitness::<F>::new();
         ecdsa_verify_target.set_targets(&mut pw, msg, pk, signature)?;
-
         let ecdsa_verify_proof = timed!(
             "prove the ecdsa signature verification (EcdsaVerifyTarget)",
             ecdsa_circuit_data.prove(pw)?
         );
-
         // sanity check
         ecdsa_circuit_data
             .verifier_data()
             .verify(ecdsa_verify_proof.clone())?;
 
         // 2. verify the ecdsa_verify proof in a EcdsaPodVerifyTarget circuit
-
         let (ecdsa_pod_target, circuit_data) = &*STANDARD_ECDSA_POD_DATA;
-
         let statements = pub_self_statements(msg, pk)
             .into_iter()
             .map(mainpod::Statement::from)
             .collect_vec();
         let id: PodId = PodId(calculate_id(&statements, params));
-
         // set targets
         let input = EcdsaPodVerifyInput {
             vd_root: vd_set.root(),
@@ -374,12 +370,10 @@ impl EcdsaPod {
             "prove the ecdsa-verification proof verification (EcdsaPod proof)",
             circuit_data.prove(pw)?
         );
-
         // sanity check
         circuit_data
             .verifier_data()
             .verify(proof_with_pis.clone())?;
-
         Ok(EcdsaPod {
             params: params.clone(),
             id,
@@ -468,9 +462,9 @@ fn pub_self_statements(
 }
 
 fn secp_field_to_limbs(v: [u64; 4]) -> Vec<F> {
-    let max_num_limbs = 8;
+    let max_num_limbs = 9;
     let v_biguint = biguint_from_array(std::array::from_fn(|i| v[i]));
-    let mut limbs = v_biguint.to_u32_digits();
+    let mut limbs = convert_base(&v_biguint.to_u32_digits(), 32, BITS);
     assert!(max_num_limbs >= limbs.len());
     limbs.resize(max_num_limbs, 0);
     let limbs_f: Vec<F> = limbs.iter().map(|l| F::from_canonical_u32(*l)).collect();
@@ -566,7 +560,6 @@ pub mod tests {
     fn get_test_ecdsa_pod() -> Result<(Box<dyn RecursivePod>, Params, VDSet, Secp256K1Scalar)> {
         let sk = ECDSASecretKey::<Secp256K1>(Secp256K1Scalar([123, 456, 789, 123]));
         let msg = Secp256K1Scalar([321, 654, 987, 321]);
-
         // first generate all the circuits data so that it does not need to be
         // computed at further stages of the test (affecting the time reports)
         timed!(
@@ -586,7 +579,6 @@ pub mod tests {
         let pk: ECDSAPublicKey<Secp256K1> =
             ECDSAPublicKey((CurveScalar(sk.0) * Secp256K1::GENERATOR_PROJECTIVE).to_affine());
         let signature: ECDSASignature<Secp256K1> = sign_message(msg, sk);
-
         let vds = vec![
             pod2::backends::plonky2::STANDARD_REC_MAIN_POD_CIRCUIT_DATA
                 .verifier_only
@@ -598,8 +590,8 @@ pub mod tests {
             STANDARD_ECDSA_POD_DATA.1.verifier_only.clone(),
         ];
         let vd_set = VDSet::new(params.max_depth_mt_vds, &vds).unwrap();
-
         // generate a new EcdsaPod from the given msg, pk, signature
+        // This is the line
         let ecdsa_pod = timed!(
             "EcdsaPod::new",
             EcdsaPod::new_boxed(&params, &vd_set, msg, pk, signature).unwrap()
@@ -627,13 +619,11 @@ pub mod tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore] // this is for the GitHub CI, it takes too long and the CI would fail.
+    #[test] // this is for the GitHub CI, it takes too long and the CI would fail.
     fn test_serialization() -> Result<()> {
+        // This is the line
         let (ecdsa_pod, params, vd_set, _) = get_test_ecdsa_pod()?;
-
         ecdsa_pod.verify().unwrap();
-
         let ecdsa_pod = (ecdsa_pod as Box<dyn Any>).downcast::<EcdsaPod>().unwrap();
         let data = ecdsa_pod.serialize_data();
         let recovered_ecdsa_pod =
@@ -641,7 +631,6 @@ pub mod tests {
         let recovered_ecdsa_pod = (recovered_ecdsa_pod as Box<dyn Any>)
             .downcast::<EcdsaPod>()
             .unwrap();
-
         assert_eq!(recovered_ecdsa_pod, ecdsa_pod);
 
         Ok(())

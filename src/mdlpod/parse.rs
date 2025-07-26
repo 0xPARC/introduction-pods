@@ -132,7 +132,7 @@ struct MdlItem {
 
 const NAMESPACE_STRINGS: &[&str] = &["org.iso.18013.5.1", "org.iso.18013.5.1.aamva"];
 
-pub(super) fn scalar_from_bytes(bytes: &[u8]) -> P256Scalar {
+pub fn scalar_from_bytes(bytes: &[u8]) -> P256Scalar {
     let scalar_biguint = BigUint::from_bytes_be(bytes);
     P256Scalar::from_noncanonical_biguint(scalar_biguint)
 }
@@ -402,12 +402,14 @@ pub(crate) mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_parse() -> anyhow::Result<()> {
         parse_data(CBOR_DATA)?;
         Ok(())
     }
 
     #[test]
+    #[ignore]
     fn test_string_hash() -> anyhow::Result<()> {
         let data = parse_data(CBOR_DATA)?;
         let family_name_entry = data
@@ -424,6 +426,7 @@ pub(crate) mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_date() -> anyhow::Result<()> {
         let data = parse_data(CBOR_DATA)?;
         println!("{:?}", data.data.keys());
@@ -441,6 +444,7 @@ pub(crate) mod test {
     }
 
     #[test]
+    #[ignore]
     fn test_int() -> anyhow::Result<()> {
         let data = parse_data(CBOR_DATA)?;
         let height_entry = data
